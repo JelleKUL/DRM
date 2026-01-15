@@ -152,6 +152,7 @@ dmypy.json
 cython_debug/
 
 # Local output 
+_input/
 _output/
 
 # PyCharm
