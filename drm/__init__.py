@@ -1,5 +1,23 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+from pathlib import Path
+import trimesh
+
+def detect_objects(binPath, model="votenet",scoreThr = 0.3, outputDir="../_output"):
+    demoFile = "../../mmdetection3d/demo/pcd_demo.py"
+    configFile = "/home/jvermandere/projects/mmdetection3d/configs/votenet/votenet_8xb8_scannet-3d.py"
+    #configFile = "../../mmdetection3d/configs/votenet/votenet_8xb16_sunrgbd-3d.py"
+    weightsFile = "/home/jvermandere/projects/DRM/_weights/votenet_8x8_scannet-3d-18class_20210823_234503-cf8134fa.pth"
+    #weightsFile = "/home/jvermandere/projects/DRM/_weights/votenet_16x8_sunrgbd-3d-10class_20210820_162823-bf11f014.pth"
+
+    command = f'python {demoFile} "{binPath}" {configFile} {weightsFile} --pred-score-thr {scoreThr} --out-dir {outputDir}'
+    print("running command: " + command)
+
+    os.system(command)
+
+    jsonFile = Path(Path(outputDir).absolute() / "preds" / Path(binPath).stem).with_suffix(".json")
+    return jsonFile
 
 def set_axes_equal(ax, pad=0.0):
     """
@@ -69,3 +87,116 @@ def plot_points_3d(points, colors=None, up_axis='z', size=20, cmap='viridis', zo
         plt.colorbar(sc, ax=ax, shrink=0.6)
 
     plt.show()
+
+def create_trimesh_box(bottom_center, size, rotation_z=0.0, color=[1,0,0,0.5]):
+    """
+    Create a trimesh Box mesh with given center, size, rotation, and color.
+    """
+    # Box is created centered at origin
+    box = trimesh.creation.box(extents=size, transform=None)
+    
+    # Rotation matrix around z-axis
+    c, s = np.cos(rotation_z), np.sin(rotation_z)
+    R = np.array([
+        [c, -s, 0, 0],
+        [s,  c, 0, 0],
+        [0,  0, 1, 0],
+        [0,  0, 0, 1]
+    ])
+    
+    # Translation to center
+    T = np.eye(4)
+    T[:3, 3] = [
+    bottom_center[0],
+    bottom_center[1],
+    bottom_center[2] + size[2] / 2.0
+    ]
+
+    # Apply transform
+    box.apply_transform(T @ R)
+    
+    # Set color (RGBA)
+    box.visual.face_colors = color
+    
+    return box
+
+def load_bin_pointcloud(file_path):
+    """Load KITTI-style .bin point cloud"""
+    points = np.fromfile(file_path, dtype=np.float32).reshape(-1, 6)  # x, y, z, rgb
+    cloud = trimesh.points.PointCloud(points[:, :3], colors=points[:, 3:6]/255)
+    return cloud
+
+def txt_pcd_to_ply(txt_path, ply_path):
+    with open(txt_path, "r") as f:
+        rows = [line.strip().split() for line in f if line.strip()]
+
+    with open(ply_path, "w") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(rows)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property float nx\n")
+        f.write("property float ny\n")
+        f.write("property float nz\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        for r in rows:
+            if len(r) != 9:
+                raise ValueError(f"Expected 9 values per row, got {len(r)}")
+
+            f.write(" ".join(r) + "\n")
+
+
+def txt_pcd_to_bin(txtPath, binPath = "", rotateX = False):
+    #if binPath is empty, save at the same location
+    if(binPath == ""):
+        binPath = (str)(Path(txtPath).with_suffix(".bin"))
+    # Load txt file
+    # Assuming format: x y z nx ny nz r g b
+    data = np.loadtxt(txtPath)
+
+    # Keep only x, y, z, r, g, b for VoteNet/ScanNet format
+    points = data[:, [0, 1, 2, 3, 4, 5]]
+    if(rotateX):
+        xyz = points[:, :3]
+        # Rotation matrix for 90 deg around X
+        R = np.array([
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 1, 0]
+        ])
+        xyz_rot = xyz @ R.T
+        points[:, :3] = xyz_rot
+    # Convert RGB from 0-255 to 0-1
+    #points[:, 3:6] /= 255.0
+
+    # Ensure float32 type
+    points = points.astype(np.float32)
+
+    # Save to .bin
+    points.tofile(binPath)
+
+    print(f"Saved {points.shape[0]} points to {binPath}")
+    return binPath
+
+def bin_to_txt(bin_path, txt_path = ""):
+    """
+    Convert VoteNet .bin (x y z r g b in 0-1) back to txt format (x y z r g b),
+    restoring RGB to 0-255.
+    """
+    if(txt_path == ""):
+        txt_path = (str)(Path(bin_path).with_suffix(".txt"))
+    points = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 6)
+    #points[:, 3:6] *= 255.0                # Restore RGB to 0-255
+    points = points.astype(np.float32)
+    # Save as txt (x y z r g b)
+    np.savetxt(txt_path, points, fmt='%.6f')
+    print(f"Saved {points.shape[0]} points to {txt_path} (RGB restored to 0-255)")
+    return txt_path
+
+
