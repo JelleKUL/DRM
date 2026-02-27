@@ -322,53 +322,59 @@ def fill_plane_holes(plane_pc, target_density=0.01):
 
 def project_planes_with_infill_mask(original_pc, filled_pc, resolution=512, point_radius=2):
     """
-    Generate a 2D orthographic image of a plane with original colors,
+    Generate a 2D orthographic image of a plane using the filled point cloud colors,
     enlarged points for visual density, and a mask highlighting filled points.
-    
+
     Parameters:
-        original_pc (trimesh.points.PointCloud): Original plane points with colors.
-        filled_pc (trimesh.points.PointCloud): Plane after filling holes.
+        original_pc (trimesh.points.PointCloud): Original plane points.
+        filled_pc (trimesh.points.PointCloud): Plane after filling holes (with high-res colors).
         resolution (int): Output image resolution (HxW).
         point_radius (int): Radius in pixels to draw each point.
-        
-    Returns:
-        img (np.ndarray): HxWx3 image with colored points enlarged.
-        mask (np.ndarray): HxW binary mask of filled points.
-    """
-    points = original_pc.vertices
-    colors = original_pc.colors.astype(np.uint8) if original_pc.colors is not None else np.full((len(points),3),255,dtype=np.uint8)
-    filled_points = filled_pc.vertices
 
-    # 1. PCA for plane alignment
+    Returns:
+        img (np.ndarray): HxWx4 image with filled colors.
+        mask (np.ndarray): HxW binary mask of filled points.
+        filled_coords (np.ndarray): Nx2 pixel coordinates of filled points.
+    """
+
+    points = original_pc.vertices
+    filled_points = filled_pc.vertices
+    colors = filled_pc.colors.astype(np.uint8) if filled_pc.colors is not None else np.full((len(filled_points),3),255,dtype=np.uint8)
+
+    # --------------------------
+    # PCA for plane alignment
+    # --------------------------
     centroid = points.mean(axis=0)
     cov = np.cov(points.T)
     eigvals, eigvecs = np.linalg.eigh(cov)
     u = eigvecs[:,2]
     v = eigvecs[:,1]
 
-    # 2. Project to 2D
+    # Project points to 2D
     points_2d = np.dot(points - centroid, np.column_stack((u,v)))
     filled_2d = np.dot(filled_points - centroid, np.column_stack((u,v)))
 
-    # 3. Convex hull bounding box for scaling
+    # --------------------------
+    # Compute scaling
+    # --------------------------
     hull = ConvexHull(filled_2d)
     min_xy = filled_2d.min(axis=0)
     max_xy = filled_2d.max(axis=0)
-
     scale = resolution / (max_xy - min_xy)
     scale_factor = np.min(scale)
 
     def to_img_coords(p):
         return np.clip(((p - min_xy) * scale_factor).astype(int), 0, resolution-1)
 
-    orig_coords = to_img_coords(points_2d)
     filled_coords = to_img_coords(filled_2d)
+    orig_coords = to_img_coords(points_2d)
 
-    # 4. Initialize image and mask
+    # --------------------------
+    # Initialize image and mask
+    # --------------------------
     img = np.zeros((resolution, resolution, 4), dtype=np.uint8)
     mask = np.zeros((resolution, resolution), dtype=np.uint8)
 
-    # 5. Function to draw a square around a point
     def draw_point(x, y, img_array, color):
         x_min = max(x - point_radius, 0)
         x_max = min(x + point_radius + 1, resolution)
@@ -376,19 +382,22 @@ def project_planes_with_infill_mask(original_pc, filled_pc, resolution=512, poin
         y_max = min(y + point_radius + 1, resolution)
         img_array[y_min:y_max, x_min:x_max] = color
 
-    # 6. Draw original points with color
-    for idx, (x,y) in enumerate(orig_coords):
+    # --------------------------
+    # Draw filled points with colors
+    # --------------------------
+    for idx, (x, y) in enumerate(filled_coords):
         draw_point(x, y, img, colors[idx])
 
-    # 7. Determine holes (new points in filled but not original)
+    # --------------------------
+    # Determine holes
+    # --------------------------
     orig_kdtree = cKDTree(points)
     dists, _ = orig_kdtree.query(filled_points)
     hole_mask = dists > 0.05
 
-    # 8. Draw holes in mask
     for idx, is_hole in enumerate(hole_mask):
         if is_hole:
             x, y = filled_coords[idx]
             draw_point(x, y, mask, 1)
 
-    return img, mask,filled_coords
+    return img, mask, filled_coords
