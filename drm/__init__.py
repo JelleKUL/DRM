@@ -7,6 +7,49 @@ import random
 from scipy.spatial import ConvexHull, Delaunay,cKDTree
 
 
+def transform_xyz_to_uv(points, tMat):
+    """
+    Apply a 4x4 transform matrix to 3D points and convert to equirectangular UV.
+
+    Args:
+        points: numpy array of shape (N,3) where each row is [x, y, z]
+        T: 4x4 transformation matrix
+
+    Returns:
+        uv: numpy array of shape (N,2) with [u,v] coordinates in [0,1]
+    """
+    N = points.shape[0]
+
+    # Convert to homogeneous coordinates (N,4)
+    points_h = np.hstack([points, np.ones((N, 1))])
+
+    # Apply transformation (matrix multiplication)
+    points_cam_h = (tMat @ points_h.T).T#(np.linalg.inv(tMat) @ points_h.T).T  # shape (N,4)
+
+    # Convert back to 3D (ignore w, assuming affine transform)
+    points_cam = points_cam_h[:, :3] #- np.repeat([[-tMat[2,3],tMat[1,3],tMat[0,3]]],N,axis = 0) # np.repeat([[tMat[0,3],tMat[1,3],tMat[2,3]]],N,axis = 0)
+
+    # --- Convert transformed points to equirectangular UV ---
+    x = points_cam[:, 0]
+    y = points_cam[:, 1]
+    z = points_cam[:, 2]
+
+    r = np.linalg.norm(points_cam, axis=1)
+    r[r == 0] = 1  # avoid division by zero
+
+    theta = np.arccos(y / r)    # polar angle
+    phi = np.arctan2(z, x)      # azimuthal angle
+
+    u = (phi + np.pi) / (2 * np.pi)
+    v = theta / np.pi
+
+    # Handle origin points safely
+    zero_mask = r == 0
+    u[zero_mask] = 0.5
+    v[zero_mask] = 0.5
+
+    return np.stack([1-u, v], axis=1)
+
 def detect_objects(binPath, model="votenet",scoreThr = 0.3, outputDir="../_output"):
     demoFile = "../../mmdetection3d/demo/pcd_demo.py"
     configFile = "/home/jvermandere/projects/mmdetection3d/configs/votenet/votenet_8xb8_scannet-3d.py"
@@ -155,7 +198,7 @@ def txt_pcd_to_ply(txt_path, ply_path):
             f.write(" ".join(r) + "\n")
 
 
-def txt_pcd_to_bin(txtPath, binPath = "", rotateX = False, containsNormals = False):
+def txt_pcd_to_bin(txtPath, binPath = "", rotateX = False, containsNormals = False, mirrorX = False,mirrorY = False,mirrorZ = False):
     #if binPath is empty, save at the same location
     if(binPath == ""):
         binPath = (str)(Path(txtPath).with_suffix(".bin"))
@@ -178,6 +221,12 @@ def txt_pcd_to_bin(txtPath, binPath = "", rotateX = False, containsNormals = Fal
         ])
         xyz_rot = xyz @ R.T
         points[:, :3] = xyz_rot
+    if(mirrorX):
+        points[:, 0] *= -1
+    if(mirrorY):
+        points[:, 1] *= -1
+    if(mirrorZ):
+        points[:, 2] *= -1
     # Convert RGB from 0-255 to 0-1
     #points[:, 3:6] /= 255.0
 
