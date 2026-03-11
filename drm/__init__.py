@@ -6,6 +6,12 @@ import trimesh
 import random
 from scipy.spatial import ConvexHull, Delaunay,cKDTree
 
+UNITY2TRIMESH_T = np.array([
+    [1, 0, 0, 0],
+    [0, 0, 1, 0],
+    [0, 1, 0, 0],
+    [0, 0, 0, 1]
+], dtype=np.float32)
 
 def transform_xyz_to_uv(points, tMat):
     """
@@ -52,10 +58,17 @@ def transform_xyz_to_uv(points, tMat):
 
 def detect_objects(binPath, model="votenet",scoreThr = 0.3, outputDir="../_output"):
     demoFile = "../../mmdetection3d/demo/pcd_demo.py"
-    configFile = "/home/jvermandere/projects/mmdetection3d/configs/votenet/votenet_8xb8_scannet-3d.py"
-    #configFile = "../../mmdetection3d/configs/votenet/votenet_8xb16_sunrgbd-3d.py"
-    weightsFile = "/home/jvermandere/projects/DRM/_weights/votenet_8x8_scannet-3d-18class_20210823_234503-cf8134fa.pth"
-    #weightsFile = "/home/jvermandere/projects/DRM/_weights/votenet_16x8_sunrgbd-3d-10class_20210820_162823-bf11f014.pth"
+    if(model == "votenet"):
+        configFile = "/home/jvermandere/projects/mmdetection3d/configs/votenet/votenet_8xb8_scannet-3d.py"
+        weightsFile = "/home/jvermandere/projects/DRM/_weights/votenet_8x8_scannet-3d-18class_20210823_234503-cf8134fa.pth"
+    elif(model == "votenet-sunrgb"):
+        configFile = "../../mmdetection3d/configs/votenet/votenet_8xb16_sunrgbd-3d.py"
+        weightsFile = "/home/jvermandere/projects/DRM/_weights/votenet_16x8_sunrgbd-3d-10class_20210820_162823-bf11f014.pth"
+    elif (model == "tr3d"):
+        configFile = "/home/jvermandere/projects/mmdetection3d/projects/TR3D/configs/tr3d_1xb16_scannet-3d-18class.py"
+        weightsFile = "/home/jvermandere/projects/DRM/_weights/tr3d_1xb16_scannet-3d-18class.pth"
+
+
 
     command = f'python {demoFile} "{binPath}" {configFile} {weightsFile} --pred-score-thr {scoreThr} --out-dir {outputDir}'
     print("running command: " + command)
