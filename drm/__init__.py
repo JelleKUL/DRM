@@ -461,3 +461,25 @@ def project_planes_with_infill_mask(original_pc, filled_pc, resolution=512, poin
             draw_point(x, y, mask, 1)
 
     return img, mask, filled_coords
+
+def rotation_matrix(axis, degrees=90):
+    theta = np.radians(degrees)
+    c, s = np.cos(theta), np.sin(theta)
+    if axis.lower() == 'x':
+        R = np.array([[1, 0, 0, 0],
+                      [0, c,-s, 0],
+                      [0, s, c, 0],
+                      [0, 0, 0, 1]])
+    elif axis.lower() == 'y':
+        R = np.array([[ c, 0, s, 0],
+                      [ 0, 1, 0, 0],
+                      [-s, 0, c, 0],
+                      [ 0, 0, 0, 1]])
+    elif axis.lower() == 'z':
+        R = np.array([[c,-s, 0, 0],
+                      [s, c, 0, 0],
+                      [0, 0, 1, 0],
+                      [0, 0, 0, 1]])
+    else:
+        raise ValueError("Axis must be 'x', 'y', or 'z'")
+    return R
