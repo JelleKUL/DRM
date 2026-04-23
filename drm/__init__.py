@@ -5,6 +5,8 @@ from pathlib import Path
 import trimesh
 import random
 from scipy.spatial import ConvexHull, Delaunay,cKDTree
+import open3d as o3d
+import copy
 
 UNITY2TRIMESH_T = np.array([
     [1, 0, 0, 0],
@@ -12,6 +14,15 @@ UNITY2TRIMESH_T = np.array([
     [0, 1, 0, 0],
     [0, 0, 0, 1]
 ], dtype=np.float32)
+
+# Converts Unity coordinate system to open3d (swap Y and Z)
+UNITY_TO_OPEN3D = np.array([
+    [1, 0, 0, 0],
+    [0, 0, 1, 0],
+    [0, 1, 0, 0],
+    [0, 0, 0, 1]
+], dtype=np.float64)
+
 
 def transform_xyz_to_uv(points, tMat):
     """
@@ -265,6 +276,146 @@ def bin_to_txt(bin_path, txt_path = ""):
     print(f"Saved {points.shape[0]} points to {txt_path} (RGB restored to 0-255)")
     return txt_path
 
+def txt_pcd_to_trimesh(txtPath, rotateX=False, mirrorX=False, mirrorY=False, mirrorZ=False):
+    """
+    Reads a point cloud .txt file and converts it to a trimesh.PointCloud.
+    
+    Expected format (with header comments):
+        # x y z nx ny nz r g b
+        x y z nx ny nz r g b
+    
+    Returns:
+        cloud  (trimesh.PointCloud) — with vertex colors set
+        normals (np.ndarray, shape N×3) — per-point normals (trimesh doesn't
+                 store these on PointCloud natively, so returned separately)
+    """
+    data = np.loadtxt(txtPath, comments="#")
+
+    # Parse columns: x y z nx ny nz r g b
+    xyz     = data[:, 0:3]
+    normals = data[:, 3:6]
+    rgb     = data[:, 6:9]          # uint8 0-255
+
+    # --- Optional transforms ---
+    if rotateX:
+        R = np.array([
+            [1,  0,  0],
+            [0,  0, -1],
+            [0,  1,  0]
+        ])
+        xyz     = xyz     @ R.T
+        normals = normals @ R.T     # rotate normals the same way
+
+    if mirrorX:
+        xyz[:, 0]     *= -1
+        normals[:, 0] *= -1
+    if mirrorY:
+        xyz[:, 1]     *= -1
+        normals[:, 1] *= -1
+    if mirrorZ:
+        xyz[:, 2]     *= -1
+        normals[:, 2] *= -1
+
+    # Build RGBA colors (trimesh wants uint8 with alpha)
+    alpha  = np.full((len(rgb), 1), 255, dtype=np.uint8)
+    colors = np.hstack([rgb.astype(np.uint8), alpha])   # N×4
+
+    # Create trimesh PointCloud
+    cloud = trimesh.PointCloud(vertices=xyz.astype(np.float32), colors=colors)
+
+    # Normalise normals and attach as metadata
+    # (trimesh.PointCloud has no dedicated normals field, so we attach them
+    #  as metadata and also return them for convenience)
+    norms_length = np.linalg.norm(normals, axis=1, keepdims=True)
+    norms_length[norms_length == 0] = 1          # avoid div-by-zero
+    normals_unit = (normals / norms_length).astype(np.float32)
+
+    cloud.metadata["normals"] = normals_unit     # retrievable later
+
+    print(f"Loaded {len(xyz)} points from {txtPath}")
+    return cloud, normals_unit
+
+
+def read_transform_matrix(txtPath, apply_unity_conversion=False):
+    """
+    Reads the 4x4 transform matrix from a point cloud .txt header.
+
+    Args:
+        txtPath               : path to the .txt point cloud file
+        apply_unity_conversion: if True, premultiplies with UNITY_TO_OPEN3D
+        save_matrix           : if True, saves the matrix as a .npy next to the input
+
+    Returns:
+        matrix (np.ndarray, shape 4×4, float64)
+    """
+    with open(txtPath, "r") as f:
+        lines = f.readlines()
+
+    matrix_start = None
+    for i, line in enumerate(lines):
+        if line.startswith("# transform_matrix"):
+            matrix_start = i + 1
+            break
+    if matrix_start is None:
+        raise ValueError(f"Transform matrix not found in file: {txtPath}")
+
+    matrix = np.fromstring(lines[matrix_start][2:], dtype=np.float64, sep=' ').reshape((4, 4))
+
+    if apply_unity_conversion:
+        matrix = UNITY_TO_OPEN3D @ matrix
+
+    return matrix
+
+
+def txt_pcd_to_open3d(txtPath, apply_transform=False, inverse_transform=True,
+                       apply_unity_conversion=True):
+    """
+    Reads a point cloud .txt file and converts it to an open3d.geometry.PointCloud.
+
+    Args:
+        txtPath               : path to the .txt point cloud file
+        rotateX               : rotate 90° around X axis
+        mirrorX/Y/Z           : flip along respective axis
+        apply_transform       : if True, reads and applies the header transform matrix
+        inverse_transform     : if True, applies the inverse of the transform instead
+        apply_unity_conversion: if True, premultiplies transform with UNITY_TO_OPEN3D
+        save_matrix           : if True, saves the transform matrix as a .npy file
+
+    Returns:
+        pcd    (open3d.geometry.PointCloud)
+        matrix (np.ndarray 4×4) or None if apply_transform is False
+    """
+    data = np.loadtxt(txtPath, comments="#")
+
+    xyz     = data[:, 0:3]
+    normals = data[:, 3:6]
+    rgb     = data[:, 6:9] / 255.0
+
+
+    # Normalise normals
+    norms_length = np.linalg.norm(normals, axis=1, keepdims=True)
+    norms_length[norms_length == 0] = 1
+    normals = normals / norms_length
+
+    # --- Build open3d PointCloud ---
+    pcd = o3d.geometry.PointCloud()
+    pcd.points  = o3d.utility.Vector3dVector(xyz.astype(np.float64))
+    pcd.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
+    pcd.colors  = o3d.utility.Vector3dVector(rgb.astype(np.float64))
+
+    # --- Optionally apply header transform ---
+    matrix = None
+    if apply_transform:
+        matrix = read_transform_matrix(txtPath,
+                                       apply_unity_conversion=False)
+        T = np.linalg.inv(matrix) if inverse_transform else matrix
+        pcd.transform(T)
+    if apply_unity_conversion:
+        pcd.transform(UNITY_TO_OPEN3D)
+
+    print(f"Loaded {len(pcd.points)} points from {txtPath}")
+    return pcd, matrix
+
 
 def ransac_plane_trimesh(points, num_iterations=1000, distance_threshold=0.01):
     best_plane = None
@@ -319,6 +470,281 @@ def visualize_pointclouds_random_colors(planes):
     
     # return the scene
     return scene
+
+def visualise_open3d_pointclouds(pcds):
+    """
+    Returns a trimesh scene that can be visualised by converting one or an array of open3d PointClouds to trimesh.
+
+    Args:
+        pcds         : open3d.geometry.PointCloud or list of them
+    Returns:
+        scene         : trimesh.Scene containing the point cloud(s)
+    """
+    if not isinstance(pcds, (list, tuple)):
+        pcds = [pcds]
+
+    scene = trimesh.Scene()
+
+    for i, pcd in enumerate(pcds):
+        xyz    = np.asarray(pcd.points).astype(np.float32)
+        # Colors: open3d is float 0-1, trimesh wants uint8 0-255
+        has_colors = pcd.has_colors()
+        if has_colors:
+            rgb   = (np.asarray(pcd.colors) * 255).astype(np.uint8)
+            alpha = np.full((len(rgb), 1), 255, dtype=np.uint8)
+            rgba  = np.hstack([rgb, alpha])
+        else:
+            rgba  = None
+
+        cloud = trimesh.PointCloud(vertices=xyz, colors=rgba)
+        scene.add_geometry(cloud, node_name=f"cloud_{i}")
+
+    return scene
+
+def randomly_transform_pointcloud(
+    pcd: o3d.geometry.PointCloud,
+    translation_bounds,
+    rotate=True,
+    up_axis="z",
+    rotation_bounds_deg=(-180.0, 180.0),
+    seed=None,
+):
+    """
+    Randomly translate an Open3D pointcloud within bounds and optionally rotate
+    around a defined up axis.
+
+    Parameters
+    ----------
+    pcd : open3d.geometry.PointCloud
+        Input point cloud.
+        
+    translation_bounds : dict or tuple
+        Either:
+        {
+            "x": (min_x, max_x),
+            "y": (min_y, max_y),
+            "z": (min_z, max_z)
+        }
+        OR
+        ((min_x,max_x), (min_y,max_y), (min_z,max_z))
+        
+    rotate : bool
+        If True, applies random rotation around up axis.
+        
+    up_axis : str
+        One of: "x", "y", "z"
+        
+    rotation_bounds_deg : tuple
+        (min_deg, max_deg) rotation range.
+        
+    seed : int or None
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    transformed_pcd : open3d.geometry.PointCloud
+        New transformed point cloud.
+        
+    transform : np.ndarray shape (4,4)
+        Applied homogeneous transform matrix.
+        
+    info : dict
+        Random translation and rotation values used.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    # Parse translation bounds
+    if isinstance(translation_bounds, dict):
+        bx = translation_bounds["x"]
+        by = translation_bounds["y"]
+        bz = translation_bounds["z"]
+    else:
+        bx, by, bz = translation_bounds
+
+    tx = rng.uniform(*bx)
+    ty = rng.uniform(*by)
+    tz = rng.uniform(*bz)
+
+    angle_deg = 0.0
+    angle_rad = 0.0
+
+    if rotate:
+        angle_deg = rng.uniform(*rotation_bounds_deg)
+        angle_rad = np.deg2rad(angle_deg)
+
+    # Rotation matrix
+    if up_axis.lower() == "x":
+        R = np.array([
+            [1, 0, 0],
+            [0, np.cos(angle_rad), -np.sin(angle_rad)],
+            [0, np.sin(angle_rad),  np.cos(angle_rad)]
+        ])
+    elif up_axis.lower() == "y":
+        R = np.array([
+            [ np.cos(angle_rad), 0, np.sin(angle_rad)],
+            [0, 1, 0],
+            [-np.sin(angle_rad), 0, np.cos(angle_rad)]
+        ])
+    elif up_axis.lower() == "z":
+        R = np.array([
+            [np.cos(angle_rad), -np.sin(angle_rad), 0],
+            [np.sin(angle_rad),  np.cos(angle_rad), 0],
+            [0, 0, 1]
+        ])
+    else:
+        raise ValueError("up_axis must be 'x', 'y', or 'z'")
+
+    transformed = copy.deepcopy(pcd)
+
+    # Full transform matrix
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = [tx, ty, tz]
+
+    transformed.transform(T)  # apply full transform (rotation + translation)
+
+    return transformed, T
+
+def radial_fov_crop_pointcloud(
+    pcd: o3d.geometry.PointCloud,
+    horizontal_fov_deg: float,
+    vertical_fov_deg: float,
+    horizontal_center_deg=None,
+    vertical_center_deg: float = 0.0,
+    origin=(0.0, 0.0, 0.0),
+    seed=None,
+    keep_normals=True,
+    keep_colors=True,
+):
+    """
+    Crop an Open3D point cloud by angular field-of-view from a fixed origin,
+    simulating a partial scan with a smaller sensor FOV.
+
+    The crop is defined in spherical angles around the origin:
+    - horizontal angle: azimuth around Z, in degrees
+    - vertical angle: elevation above horizon, in degrees
+
+    The horizontal center is random if not provided.
+
+    Parameters
+    ----------
+    pcd : o3d.geometry.PointCloud
+        Input point cloud.
+
+    horizontal_fov_deg : float
+        Width of the horizontal field of view in degrees.
+
+    vertical_fov_deg : float
+        Height of the vertical field of view in degrees.
+
+    horizontal_center_deg : float or None
+        Center azimuth in degrees. If None, sampled uniformly from [-180, 180).
+
+    vertical_center_deg : float
+        Center elevation in degrees.
+
+    origin : tuple[float, float, float]
+        Sensor origin from which angles are measured.
+
+    seed : int or None
+        Random seed for reproducibility.
+
+    keep_normals : bool
+        Preserve normals if present.
+
+    keep_colors : bool
+        Preserve colors if present.
+
+    Returns
+    -------
+    cropped_pcd : o3d.geometry.PointCloud
+        Cropped partial scan.
+
+    mask : np.ndarray
+        Boolean mask over original points indicating which were kept.
+
+    info : dict
+        Metadata about the chosen crop window.
+    """
+    if horizontal_fov_deg <= 0 or horizontal_fov_deg > 360:
+        raise ValueError("horizontal_fov_deg must be in (0, 360].")
+    if vertical_fov_deg <= 0 or vertical_fov_deg > 180:
+        raise ValueError("vertical_fov_deg must be in (0, 180].")
+
+    rng = np.random.default_rng(seed)
+
+    if horizontal_center_deg is None:
+        horizontal_center_deg = rng.uniform(-180.0, 180.0)
+
+    pts = np.asarray(pcd.points)
+    if pts.shape[0] == 0:
+        return o3d.geometry.PointCloud(), np.array([], dtype=bool), {
+            "horizontal_center_deg": horizontal_center_deg,
+            "vertical_center_deg": vertical_center_deg,
+            "horizontal_fov_deg": horizontal_fov_deg,
+            "vertical_fov_deg": vertical_fov_deg,
+            "num_kept": 0,
+            "num_total": 0,
+        }
+
+    origin = np.asarray(origin, dtype=float)
+    rel = pts - origin[None, :]
+
+    x = rel[:, 0]
+    y = rel[:, 1]
+    z = rel[:, 2]
+
+    r_xy = np.sqrt(x**2 + y**2)
+    r = np.sqrt(x**2 + y**2 + z**2)
+
+    # Avoid divide-by-zero for points exactly at the origin
+    valid = r > 1e-12
+
+    # Horizontal angle (azimuth): [-180, 180]
+    azimuth_deg = np.degrees(np.arctan2(y, x))
+
+    # Vertical angle (elevation): [-90, 90]
+    elevation_deg = np.degrees(np.arctan2(z, r_xy))
+
+    def wrapped_angle_diff_deg(a, b):
+        """Smallest signed angular difference a-b in degrees, wrapped to [-180, 180)."""
+        return (a - b + 180.0) % 360.0 - 180.0
+
+    half_h = horizontal_fov_deg / 2.0
+    half_v = vertical_fov_deg / 2.0
+
+    az_diff = wrapped_angle_diff_deg(azimuth_deg, horizontal_center_deg)
+    el_diff = elevation_deg - vertical_center_deg
+
+    mask = (
+        valid
+        & (np.abs(az_diff) <= half_h)
+        & (np.abs(el_diff) <= half_v)
+    )
+
+    cropped = o3d.geometry.PointCloud()
+    cropped.points = o3d.utility.Vector3dVector(pts[mask])
+
+    if keep_colors and pcd.has_colors():
+        colors = np.asarray(pcd.colors)
+        cropped.colors = o3d.utility.Vector3dVector(colors[mask])
+
+    if keep_normals and pcd.has_normals():
+        normals = np.asarray(pcd.normals)
+        cropped.normals = o3d.utility.Vector3dVector(normals[mask])
+
+    info = {
+        "horizontal_center_deg": float(horizontal_center_deg),
+        "vertical_center_deg": float(vertical_center_deg),
+        "horizontal_fov_deg": float(horizontal_fov_deg),
+        "vertical_fov_deg": float(vertical_fov_deg),
+        "num_kept": int(mask.sum()),
+        "num_total": int(len(mask)),
+        "fraction_kept": float(mask.mean()) if len(mask) > 0 else 0.0,
+    }
+
+    return cropped, mask, info
 
 def fill_plane_holes(plane_pc, target_density=0.01):
     """
