@@ -23,6 +23,39 @@ UNITY_TO_OPEN3D = np.array([
     [0, 0, 0, 1]
 ], dtype=np.float64)
 
+def o3d_mesh_to_trimesh(mesh: o3d.geometry.TriangleMesh) -> trimesh.Trimesh:
+    return trimesh.Trimesh(
+        vertices=np.asarray(mesh.vertices),
+        faces=np.asarray(mesh.triangles),
+        vertex_normals=np.asarray(mesh.vertex_normals),
+        vertex_colors=np.asarray(mesh.vertex_colors)
+    )
+
+def o3d_pointcloud_to_trimesh(pcd: o3d.geometry.PointCloud) -> trimesh.Trimesh:
+    
+    return trimesh.PointCloud(
+        vertices=np.asarray(pcd.points),
+        vertex_colors=np.asarray(pcd.colors) if pcd.has_colors() else None
+    )
+
+def lineset_to_trimesh_path(lineset: o3d.geometry.LineSet) -> trimesh.path.Path3D:
+    """
+    Convert an open3d LineSet to a trimesh Path3D for rendering.
+
+    Args:
+        lineset : open3d.geometry.LineSet
+
+    Returns:
+        trimesh.path.Path3D
+    """
+    points = np.asarray(lineset.points)
+    lines  = np.asarray(lineset.lines)   # Nx2 indices into points
+
+    # Build trimesh line entities
+    entities = [trimesh.path.entities.Line(line) for line in lines]
+
+    path = trimesh.path.Path3D(entities=entities, vertices=points, colors=[[255, 0, 0, 255]] * len(entities))
+    return path
 
 def transform_xyz_to_uv(points, tMat):
     """
@@ -471,7 +504,7 @@ def visualize_pointclouds_random_colors(planes):
     # return the scene
     return scene
 
-def visualise_open3d_pointclouds(pcds):
+def visualise_open3d_pointclouds(pcds, randomColor = False):
     """
     Returns a trimesh scene that can be visualised by converting one or an array of open3d PointClouds to trimesh.
 
@@ -489,12 +522,13 @@ def visualise_open3d_pointclouds(pcds):
         xyz    = np.asarray(pcd.points).astype(np.float32)
         # Colors: open3d is float 0-1, trimesh wants uint8 0-255
         has_colors = pcd.has_colors()
-        if has_colors:
+        if(randomColor or not has_colors):
+                color = np.array([random.random(), random.random(), random.random(),1]) * 255
+                rgba = np.tile(color, (len(xyz), 1)).astype(np.uint8)
+        else:
             rgb   = (np.asarray(pcd.colors) * 255).astype(np.uint8)
             alpha = np.full((len(rgb), 1), 255, dtype=np.uint8)
             rgba  = np.hstack([rgb, alpha])
-        else:
-            rgba  = None
 
         cloud = trimesh.PointCloud(vertices=xyz, colors=rgba)
         scene.add_geometry(cloud, node_name=f"cloud_{i}")
