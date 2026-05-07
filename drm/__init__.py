@@ -7,6 +7,7 @@ import random
 from scipy.spatial import ConvexHull, Delaunay,cKDTree
 import open3d as o3d
 import copy
+from typing import Union, List
 
 UNITY2TRIMESH_T = np.array([
     [1, 0, 0, 0],
@@ -504,36 +505,211 @@ def visualize_pointclouds_random_colors(planes):
     # return the scene
     return scene
 
-def visualise_open3d_pointclouds(pcds, randomColor = False):
+# ── Type alias for anything this function accepts ─────────────────────────────
+O3DGeometry = Union[
+    o3d.geometry.PointCloud,
+    o3d.geometry.TriangleMesh,
+    o3d.geometry.LineSet,
+    o3d.geometry.VoxelGrid,
+    o3d.geometry.AxisAlignedBoundingBox,
+    o3d.geometry.OrientedBoundingBox,
+]
+ 
+ 
+def _random_rgba() -> np.ndarray:
+    """Return a random opaque RGBA color as uint8 (1, 4)."""
+    return (np.array([random.random(), random.random(), random.random(), 1.0]) * 255).astype(np.uint8)
+ 
+ 
+# ── Per-type converters ───────────────────────────────────────────────────────
+ 
+def _convert_pointcloud(pcd: o3d.geometry.PointCloud, random_color: bool):
+    xyz = np.asarray(pcd.points).astype(np.float32)
+    if random_color or not pcd.has_colors():
+        rgba = np.tile(_random_rgba(), (len(xyz), 1))
+    else:
+        rgb  = (np.asarray(pcd.colors) * 255).astype(np.uint8)
+        rgba = np.hstack([rgb, np.full((len(rgb), 1), 255, dtype=np.uint8)])
+    return trimesh.PointCloud(vertices=xyz, colors=rgba)
+ 
+ 
+def _convert_trianglemesh(mesh: o3d.geometry.TriangleMesh, random_color: bool):
+    verts = np.asarray(mesh.vertices).astype(np.float32)
+    faces = np.asarray(mesh.triangles)
+ 
+    if random_color:
+        color = _random_rgba()
+        vertex_colors = np.tile(color, (len(verts), 1))
+    elif mesh.has_vertex_colors():
+        rgb   = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8)
+        vertex_colors = np.hstack([rgb, np.full((len(rgb), 1), 255, dtype=np.uint8)])
+    else:
+        vertex_colors = None
+ 
+    kwargs = dict(vertices=verts, faces=faces)
+    if vertex_colors is not None:
+        kwargs["vertex_colors"] = vertex_colors
+ 
+    tm = trimesh.Trimesh(**kwargs)
+ 
+    if mesh.has_vertex_normals():
+        tm.vertex_normals = np.asarray(mesh.vertex_normals).astype(np.float32)
+ 
+    return tm
+ 
+ 
+def _convert_lineset(ls: o3d.geometry.LineSet, random_color: bool):
+    pts   = np.asarray(ls.points)
+    lines = np.asarray(ls.lines)          # (M, 2) int indices
+ 
+    if len(pts) == 0 or len(lines) == 0:
+        return None
+ 
+    if random_color or not ls.has_colors():
+        fallback = _random_rgba()
+        entities = [
+            trimesh.path.entities.Line(seg, color=fallback)
+            for seg in lines
+        ]
+    else:
+        line_rgb  = (np.asarray(ls.colors) * 255).astype(np.uint8)
+        line_rgba = np.hstack([line_rgb, np.full((len(line_rgb), 1), 255, dtype=np.uint8)])
+        entities  = [
+            trimesh.path.entities.Line(seg, color=line_rgba[i])
+            for i, seg in enumerate(lines)
+        ]
+ 
+    return trimesh.path.Path3D(entities=entities, vertices=pts)
+ 
+ 
+def _convert_voxelgrid(vg: o3d.geometry.VoxelGrid, random_color: bool):
     """
-    Returns a trimesh scene that can be visualised by converting one or an array of open3d PointClouds to trimesh.
-
-    Args:
-        pcds         : open3d.geometry.PointCloud or list of them
-    Returns:
-        scene         : trimesh.Scene containing the point cloud(s)
+    Represent each voxel as a small trimesh Box.
+    All boxes are merged into a single Trimesh for efficiency.
     """
-    if not isinstance(pcds, (list, tuple)):
-        pcds = [pcds]
-
-    scene = trimesh.Scene()
-
-    for i, pcd in enumerate(pcds):
-        xyz    = np.asarray(pcd.points).astype(np.float32)
-        # Colors: open3d is float 0-1, trimesh wants uint8 0-255
-        has_colors = pcd.has_colors()
-        if(randomColor or not has_colors):
-                color = np.array([random.random(), random.random(), random.random(),1]) * 255
-                rgba = np.tile(color, (len(xyz), 1)).astype(np.uint8)
+    voxels = vg.get_voxels()
+    if not voxels:
+        return None
+ 
+    s    = vg.voxel_size
+    ext  = np.array([s, s, s])
+    meshes = []
+ 
+    fixed_color = _random_rgba() if random_color else None
+ 
+    for v in voxels:
+        center = vg.get_voxel_center_coordinate(v.grid_index)
+        box    = trimesh.creation.box(extents=ext)
+        box.apply_translation(center)
+ 
+        if fixed_color is not None:
+            color = fixed_color
         else:
-            rgb   = (np.asarray(pcd.colors) * 255).astype(np.uint8)
-            alpha = np.full((len(rgb), 1), 255, dtype=np.uint8)
-            rgba  = np.hstack([rgb, alpha])
-
-        cloud = trimesh.PointCloud(vertices=xyz, colors=rgba)
-        scene.add_geometry(cloud, node_name=f"cloud_{i}")
-
+            rgb   = (np.asarray(v.color) * 255).astype(np.uint8)
+            color = np.append(rgb, 255).astype(np.uint8)
+ 
+        box.visual.face_colors = np.tile(color, (len(box.faces), 1))
+        meshes.append(box)
+ 
+    return trimesh.util.concatenate(meshes)
+ 
+ 
+def _bbox_to_path3d(pts_8: np.ndarray, color_rgba: np.ndarray) -> trimesh.path.Path3D:
+    """
+    Build a trimesh Path3D wireframe from 8 corner points of a bounding box.
+    open3d get_box_points() returns corners in a fixed order — the 12 edges
+    are hard-coded to match that order.
+    """
+    # Edge pairs for an OBB / AABB returned by o3d.get_box_points()
+    edges = [
+        [0, 1], [0, 2], [0, 3],
+        [1, 6], [1, 7],
+        [2, 5], [2, 7],
+        [3, 5], [3, 6],
+        [4, 5], [4, 6], [4, 7],
+    ]
+    entities = [trimesh.path.entities.Line(e, color=color_rgba) for e in edges]
+    return trimesh.path.Path3D(entities=entities, vertices=pts_8)
+ 
+ 
+def _convert_aabb(aabb: o3d.geometry.AxisAlignedBoundingBox, random_color: bool):
+    pts   = np.asarray(aabb.get_box_points())
+    color = _random_rgba() if random_color else np.array([*((np.asarray(aabb.color) * 255).astype(np.uint8)), 255], dtype=np.uint8)
+    return _bbox_to_path3d(pts, color)
+ 
+ 
+def _convert_obb(obb: o3d.geometry.OrientedBoundingBox, random_color: bool):
+    pts   = np.asarray(obb.get_box_points())
+    color = _random_rgba() if random_color else np.array([*((np.asarray(obb.color) * 255).astype(np.uint8)), 255], dtype=np.uint8)
+    return _bbox_to_path3d(pts, color)
+ 
+ 
+# ── Dispatch table ─────────────────────────────────────────────────────────────
+ 
+_CONVERTERS = {
+    o3d.geometry.PointCloud:              _convert_pointcloud,
+    o3d.geometry.TriangleMesh:            _convert_trianglemesh,
+    o3d.geometry.LineSet:                 _convert_lineset,
+    o3d.geometry.VoxelGrid:              _convert_voxelgrid,
+    o3d.geometry.AxisAlignedBoundingBox: _convert_aabb,
+    o3d.geometry.OrientedBoundingBox:    _convert_obb,
+}
+ 
+ 
+# ── Public API ─────────────────────────────────────────────────────────────────
+ 
+def visualise_open3d(
+    geometries: Union[O3DGeometry, List[O3DGeometry]],
+    random_color: bool = False,
+) -> trimesh.Scene:
+    """
+    Convert one or more Open3D geometry objects into a trimesh Scene.
+ 
+    Supported types
+    ---------------
+    - PointCloud           → trimesh.PointCloud
+    - TriangleMesh         → trimesh.Trimesh  (vertex colors + normals preserved)
+    - LineSet              → trimesh.path.Path3D  (per-segment colors preserved)
+    - VoxelGrid            → trimesh.Trimesh  (one box per voxel, merged)
+    - AxisAlignedBoundingBox → trimesh.path.Path3D  (wireframe)
+    - OrientedBoundingBox  → trimesh.path.Path3D  (wireframe)
+ 
+    Parameters
+    ----------
+    geometries   : single geometry or list/tuple of geometries (may be mixed types)
+    random_color : if True, override all colors with a random color per object
+ 
+    Returns
+    -------
+    trimesh.Scene
+    """
+    if not isinstance(geometries, (list, tuple)):
+        geometries = [geometries]
+ 
+    scene   = trimesh.Scene()
+    counts  = {}   # track per-type index for unique node names
+ 
+    for geom in geometries:
+        geom_type = type(geom)
+        converter = _CONVERTERS.get(geom_type)
+ 
+        if converter is None:
+            print(f"[visualise_open3d] Unsupported type {geom_type.__name__}, skipping.")
+            continue
+ 
+        result = converter(geom, random_color)
+        if result is None:
+            continue
+ 
+        # Build a unique node name: e.g. "PointCloud_0", "LineSet_2"
+        label = geom_type.__name__
+        idx   = counts.get(label, 0)
+        counts[label] = idx + 1
+ 
+        scene.add_geometry(result, node_name=f"{label}_{idx}")
+ 
     return scene
+ 
 
 def randomly_transform_pointcloud(
     pcd: o3d.geometry.PointCloud,

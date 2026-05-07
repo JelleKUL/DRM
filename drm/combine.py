@@ -118,129 +118,150 @@ def filter_pcd_by_distance(sourcePcd: o3d.geometry.PointCloud,
 
 def build_occlusion_grid(
     reference: o3d.geometry.PointCloud,
-    voxel_size: float = 0.05
-) -> tuple:
-    # --- Step 1: Translate point cloud so scanner is at origin ---
-    pts_world    = np.asarray(reference.points)
-    pts_centered = pts_world
+    scanner_pos: np.ndarray,
+    voxel_size: float = 0.05,
+) -> tuple[o3d.geometry.VoxelGrid, o3d.geometry.VoxelGrid]:
+    """
+    Builds occupied and occluded voxel grids from a reference point cloud.
 
-    # --- Step 2: OBB local frame of the shifted cloud ---
-    shifted_pcd = o3d.geometry.PointCloud()
-    shifted_pcd.points = o3d.utility.Vector3dVector(pts_centered)
-    obb    = shifted_pcd.get_oriented_bounding_box()
+    Internally shifts the cloud so the scanner is at the origin, rotates into
+    the OBB local frame for compact voxelization, then ray marches from the
+    scanner through each occupied voxel to find the occluded shadow behind it.
+    Both grids are returned in world space.
+
+    Parameters
+    ----------
+    reference   : point cloud that defines the geometry (e.g. var_pcd)
+    scanner_pos : world-space position of the scanner that captured reference
+    voxel_size  : edge length of each voxel in metres
+
+    Returns
+    -------
+    occupied_grid : VoxelGrid — voxels containing at least one point
+    occluded_grid : VoxelGrid — empty voxels in the shadow behind geometry
+    """
+    pts_shifted = np.asarray(reference.points) - scanner_pos
+
+    pts_shifted = np.asarray(reference.points) - scanner_pos
+
+    shifted_pcd        = o3d.geometry.PointCloud()
+    shifted_pcd.points = o3d.utility.Vector3dVector(pts_shifted)
+    obb    = shifted_pcd.get_minimal_oriented_bounding_box()
     R      = np.asarray(obb.R)
     center = np.asarray(obb.center)
 
-    pts_local = (pts_centered - center) @ R
+    pts_local = (pts_shifted - center) @ R
+    min_bound = pts_local.min(axis=0)
+    max_bound = pts_local.max(axis=0)
+    grid_size = np.floor((max_bound - min_bound) / voxel_size).astype(int) + 1
 
-    # --- Step 3: Voxel indices ---
-    min_bound_local = pts_local.min(axis=0)
-    max_bound_local = pts_local.max(axis=0)
-    grid_size       = np.floor((max_bound_local - min_bound_local) / voxel_size).astype(int) + 1
+    voxel_indices = np.floor((pts_local - min_bound) / voxel_size).astype(int)
+    occupied_set  = set(map(tuple, voxel_indices))
 
-    voxel_indices   = np.floor((pts_local - min_bound_local) / voxel_size).astype(int)
-    occupied_voxels = set(map(tuple, voxel_indices))
-
-    # Scanner is at origin in shifted space — transform (0,0,0) into local frame
+    # FIX: split into two steps to avoid precedence bug
     origin_local = (np.zeros(3) - center) @ R
-    origin_voxel = (origin_local - min_bound_local) / voxel_size
+    origin_voxel = (origin_local - min_bound) / voxel_size
 
-    # --- Step 4: Ray march from origin through each occupied voxel ---
-    occluded_voxels = set()
-
-    for voxel in occupied_voxels:
-        voxel_f    = np.array(voxel, dtype=float) + 0.5
-        ray_dir    = voxel_f - origin_voxel
+    occluded_set = set()
+    for voxel in occupied_set:
+        ray_dir    = np.array(voxel, dtype=float) + 0.5 - origin_voxel
         ray_length = np.linalg.norm(ray_dir)
         if ray_length == 0:
             continue
         ray_dir_n = ray_dir / ray_length
-
-        t     = ray_length + 1.0
-        t_max = ray_length + np.linalg.norm(grid_size)
+        t         = ray_length + 1.0
+        t_max     = ray_length + np.linalg.norm(grid_size)
 
         while t < t_max:
             current = np.floor(origin_voxel + t * ray_dir_n).astype(int)
             if np.any(current < 0) or np.any(current >= grid_size):
                 break
             current_tuple = tuple(current)
-            if current_tuple not in occupied_voxels:
-                occluded_voxels.add(current_tuple)
+            if current_tuple not in occupied_set:
+                occluded_set.add(current_tuple)
             t += 1.0
 
-    return occluded_voxels, occupied_voxels, obb, R, min_bound_local
+    def set_to_voxel_grid(voxel_set: set, color: list) -> o3d.geometry.VoxelGrid:
+        indices       = np.array(list(voxel_set))
+        centres_world = (indices + 0.5) * voxel_size + min_bound
+        centres_world = centres_world @ R.T + center + scanner_pos
+        pcd           = o3d.geometry.PointCloud()
+        pcd.points    = o3d.utility.Vector3dVector(centres_world)
+        pcd.paint_uniform_color(color)
+        return o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size)
+
+    occupied_grid = set_to_voxel_grid(occupied_set, [0.86, 0.24, 0.24])
+    occluded_grid = set_to_voxel_grid(occluded_set, [0.24, 0.47, 0.86])
+
+    return occupied_grid, occluded_grid
 
 
 def get_invisible_points_grid(
     points: o3d.geometry.PointCloud,
     reference: o3d.geometry.PointCloud,
-    voxel_size: float = 0.05
-) -> o3d.geometry.PointCloud:
-    occluded_voxels, occupied_voxels, obb, R, min_bound_local = build_occlusion_grid(
-        reference, voxel_size
-    )
+    scanner_pos: np.ndarray,
+    voxel_size: float = 0.05,
+) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
+    """
+    Classifies each point in `points` as invisible (occluded or inside geometry)
+    or visible, using the occlusion grid built from `reference`.
 
-    center = np.asarray(obb.center)
-    pts    = np.asarray(points.points)
+    Parameters
+    ----------
+    points      : point cloud to classify (e.g. uncovered candidate points)
+    reference   : point cloud that defines the geometry (e.g. var_pcd)
+    scanner_pos : world-space position of the scanner that captured reference
+    voxel_size  : must match the value used to build the grid
 
-    # Apply the same shift before transforming into local frame
-    pts_local  = (pts - center) @ R
-    voxel_idxs = [tuple(np.floor((p - min_bound_local) / voxel_size).astype(int)) for p in pts_local]
+    Returns
+    -------
+    invisible : points inside occupied or occluded voxels
+    visible   : remaining points
+    """
+    occupied_grid, occluded_grid = build_occlusion_grid(reference, scanner_pos, voxel_size)
 
-    invisible_mask = np.array([
-        idx in occluded_voxels or idx in occupied_voxels
-        for idx in voxel_idxs
-    ])
+    pts_world      = o3d.utility.Vector3dVector(np.asarray(points.points))
+    in_occupied    = np.asarray(occupied_grid.check_if_included(pts_world))
+    in_occluded    = np.asarray(occluded_grid.check_if_included(pts_world))
+    invisible_mask = in_occupied | in_occluded
 
-    return points.select_by_index(np.where(invisible_mask)[0])
+    invisible = points.select_by_index(np.where(invisible_mask)[0])
+    visible   = points.select_by_index(np.where(~invisible_mask)[0])
+    return invisible, visible
 
 
 def visualise_occlusion_grid(
-    occluded_voxels: set,
-    occupied_voxels: set,
-    obb: o3d.geometry.OrientedBoundingBox,
-    R: np.ndarray,
-    min_bound_local: np.ndarray,
+    occupied_grid: o3d.geometry.VoxelGrid,
+    occluded_grid: o3d.geometry.VoxelGrid,
+    scanner_pos: np.ndarray,
     voxel_size: float = 0.05,
     show_occupied: bool = True,
     show_occluded: bool = True,
-) -> trimesh.Scene:
-    center = np.asarray(obb.center)
+    show_scanner: bool = True,
+) -> list[o3d.geometry.Geometry]:
+    """
+    Returns a list of native o3d geometries ready for show_geometries() or
+    o3d.visualization.draw_geometries().
 
-    unit_cube  = trimesh.creation.box(extents=[1, 1, 1])
-    unit_verts = np.asarray(unit_cube.vertices)
-    faces      = np.asarray(unit_cube.faces)
-
-    def voxels_to_mesh(voxel_set: set, color: list) -> trimesh.Trimesh:
-        if not voxel_set:
-            return None
-        indices       = np.array(list(voxel_set))
-        centres_local = (indices + 0.5) * voxel_size + min_bound_local
-        centres_world = centres_local @ R.T + center
-
-        K         = len(indices)
-        all_verts = (unit_verts[np.newaxis] * voxel_size + centres_world[:, np.newaxis, :]).reshape(-1, 3)
-        offsets   = np.arange(K)[:, np.newaxis, np.newaxis] * 8
-        all_faces = (faces[np.newaxis] + offsets).reshape(-1, 3)
-
-        mesh = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=False)
-        mesh.visual.face_colors = np.tile(
-            np.array([int(c) for c in color], dtype=np.uint8),
-            (len(all_faces), 1)
-        )
-        return mesh
-
-    scene = trimesh.Scene()
+    Parameters
+    ----------
+    occupied_grid : first return value of build_occlusion_grid
+    occluded_grid : second return value of build_occlusion_grid
+    scanner_pos   : world-space scanner position, used to place the marker sphere
+    voxel_size    : used to size the scanner marker sphere
+    """
+    geometries = []
     if show_occupied:
-        m = voxels_to_mesh(occupied_voxels, color=[220, 60, 60, 180])
-        if m is not None:
-            scene.add_geometry(m, node_name="occupied")
+        geometries.append(occupied_grid)
     if show_occluded:
-        m = voxels_to_mesh(occluded_voxels, color=[60, 120, 220, 120])
-        if m is not None:
-            scene.add_geometry(m, node_name="occluded")
-
-    return scene
+        geometries.append(occluded_grid)
+    if show_scanner:
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=voxel_size * 1.5)
+        sphere.translate(scanner_pos)
+        sphere.paint_uniform_color([1.0, 0.85, 0.0])
+        sphere.compute_vertex_normals()
+        geometries.append(sphere)
+    return geometries
 
 
 def is_occluded(
