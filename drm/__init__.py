@@ -24,6 +24,14 @@ UNITY_TO_OPEN3D = np.array([
     [0, 0, 0, 1]
 ], dtype=np.float64)
 
+def transform_points(pts_3d: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """Apply a 4×4 homogeneous transform to an (N,3) array."""
+    ones = np.ones((len(pts_3d), 1), dtype=np.float64)
+    pts_h = np.hstack([pts_3d, ones])          # (N, 4)
+    return (T @ pts_h.T).T[:, :3]              # (N, 3)
+
+
+
 def o3d_mesh_to_trimesh(mesh: o3d.geometry.TriangleMesh) -> trimesh.Trimesh:
     return trimesh.Trimesh(
         vertices=np.asarray(mesh.vertices),
