@@ -125,8 +125,9 @@ def build_occlusion_grid(
     Builds occupied and occluded voxel grids from a reference point cloud.
 
     Internally shifts the cloud so the scanner is at the origin, rotates into
-    the OBB local frame for compact voxelization, then ray marches from the
-    scanner through each occupied voxel to find the occluded shadow behind it.
+    the OBB local frame for compact voxelization, then for every voxel in the
+    grid that is NOT occupied, marches from the scanner toward that voxel to
+    determine whether an occupied voxel blocks the line of sight (occlusion).
     Both grids are returned in world space.
 
     Parameters
@@ -140,8 +141,6 @@ def build_occlusion_grid(
     occupied_grid : VoxelGrid — voxels containing at least one point
     occluded_grid : VoxelGrid — empty voxels in the shadow behind geometry
     """
-    pts_shifted = np.asarray(reference.points) - scanner_pos
-
     pts_shifted = np.asarray(reference.points) - scanner_pos
 
     shifted_pcd        = o3d.geometry.PointCloud()
@@ -158,28 +157,45 @@ def build_occlusion_grid(
     voxel_indices = np.floor((pts_local - min_bound) / voxel_size).astype(int)
     occupied_set  = set(map(tuple, voxel_indices))
 
-    # FIX: split into two steps to avoid precedence bug
     origin_local = (np.zeros(3) - center) @ R
     origin_voxel = (origin_local - min_bound) / voxel_size
 
+    # Build the full set of candidate voxels (everything not occupied)
+    all_indices = [
+        (x, y, z)
+        for x in range(grid_size[0])
+        for y in range(grid_size[1])
+        for z in range(grid_size[2])
+    ]
+
     occluded_set = set()
-    for voxel in occupied_set:
-        ray_dir    = np.array(voxel, dtype=float) + 0.5 - origin_voxel
-        ray_length = np.linalg.norm(ray_dir)
+    for voxel in all_indices:
+        if voxel in occupied_set:
+            continue  # occupied voxels are never occluded
+
+        voxel_center = np.array(voxel, dtype=float) + 0.5
+        ray_dir      = voxel_center - origin_voxel
+        ray_length   = np.linalg.norm(ray_dir)
         if ray_length == 0:
             continue
         ray_dir_n = ray_dir / ray_length
-        t         = ray_length + 1.0
-        t_max     = ray_length + np.linalg.norm(grid_size)
 
-        while t < t_max:
-            current = np.floor(origin_voxel + t * ray_dir_n).astype(int)
-            if np.any(current < 0) or np.any(current >= grid_size):
+        # March from scanner toward this voxel in steps of ~half a voxel.
+        # If we hit an occupied voxel before arriving, this voxel is occluded.
+        step  = 0.5                  # sub-voxel step to avoid skipping thin geometry
+        t     = step
+        occluded = False
+        while t < ray_length - step: # stop just before the target voxel
+            sample = np.floor(origin_voxel + t * ray_dir_n).astype(int)
+            if np.any(sample < 0) or np.any(sample >= grid_size):
                 break
-            current_tuple = tuple(current)
-            if current_tuple not in occupied_set:
-                occluded_set.add(current_tuple)
-            t += 1.0
+            if tuple(sample) in occupied_set:
+                occluded = True
+                break
+            t += step
+
+        if occluded:
+            occluded_set.add(voxel)
 
     def set_to_voxel_grid(voxel_set: set, color: list) -> o3d.geometry.VoxelGrid:
         indices       = np.array(list(voxel_set))
@@ -190,11 +206,10 @@ def build_occlusion_grid(
         pcd.paint_uniform_color(color)
         return o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size)
 
-    occupied_grid = set_to_voxel_grid(occupied_set, [0.86, 0.24, 0.24])
-    occluded_grid = set_to_voxel_grid(occluded_set, [0.24, 0.47, 0.86])
+    occupied_grid = set_to_voxel_grid(occupied_set, [0.24, 0.24, 0.86])
+    occluded_grid = set_to_voxel_grid(occluded_set, [0.93, 0.26, 0.13])
 
     return occupied_grid, occluded_grid
-
 
 def get_invisible_points_grid(
     points: o3d.geometry.PointCloud,
