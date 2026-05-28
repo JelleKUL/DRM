@@ -7,7 +7,7 @@ import random
 from scipy.spatial import ConvexHull, Delaunay,cKDTree
 import open3d as o3d
 import copy
-from typing import Union, List
+from typing import Optional, Union, List
 
 UNITY2TRIMESH_T = np.array([
     [1, 0, 0, 0],
@@ -23,6 +23,144 @@ UNITY_TO_OPEN3D = np.array([
     [0, 1, 0, 0],
     [0, 0, 0, 1]
 ], dtype=np.float64)
+
+
+def trimesh_to_open3d(
+    geometry: Union[trimesh.Trimesh, trimesh.PointCloud],
+) -> Union[o3d.geometry.TriangleMesh, o3d.geometry.PointCloud]:
+    """
+    Convert a trimesh Trimesh or PointCloud to its Open3D equivalent.
+
+    Parameters
+    ----------
+    geometry : trimesh.Trimesh or trimesh.PointCloud
+
+    Returns
+    -------
+    o3d.geometry.TriangleMesh  — if input is a Trimesh
+    o3d.geometry.PointCloud    — if input is a PointCloud
+
+    Transferred attributes
+    ----------------------
+    Trimesh   : vertices, faces, vertex normals, face normals, vertex colors
+    PointCloud: points, colors, normals (when present)
+    """
+    if(isinstance(geometry, list)):
+        return [trimesh_to_open3d(g) for g in geometry]
+    
+    if isinstance(geometry, trimesh.Trimesh):
+        return _trimesh_mesh_to_o3d(geometry)
+    elif isinstance(geometry, trimesh.PointCloud):
+        return _trimesh_pcd_to_o3d(geometry)
+    else:
+        raise TypeError(
+            f"Expected trimesh.Trimesh or trimesh.PointCloud, got {type(geometry)}"
+        )
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _to_float_colors(colors: np.ndarray) -> np.ndarray:
+    """Normalise uint8 [0-255] or float [0-1] RGBA/RGB → float64 RGB [0-1]."""
+    c = np.asarray(colors, dtype=np.float64)
+    if c.max() > 1.0:          # uint8 path
+        c = c / 255.0
+    return c[:, :3]            # drop alpha channel if present
+
+
+def _trimesh_mesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
+    o3d_mesh = o3d.geometry.TriangleMesh()
+
+    o3d_mesh.vertices  = o3d.utility.Vector3dVector(np.asarray(mesh.vertices,  dtype=np.float64))
+    o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces,     dtype=np.int32))
+
+    # Vertex normals
+    if mesh.vertex_normals is not None and len(mesh.vertex_normals):
+        o3d_mesh.vertex_normals = o3d.utility.Vector3dVector(
+            np.asarray(mesh.vertex_normals, dtype=np.float64)
+        )
+
+    # Triangle normals
+    if mesh.face_normals is not None and len(mesh.face_normals):
+        o3d_mesh.triangle_normals = o3d.utility.Vector3dVector(
+            np.asarray(mesh.face_normals, dtype=np.float64)
+        )
+
+    # Vertex colors (stored in mesh.visual for ColorVisuals)
+    try:
+        if hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors is not None:
+            vc = mesh.visual.vertex_colors          # (N, 4) uint8
+            if len(vc) == len(mesh.vertices):
+                o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(_to_float_colors(vc))
+    except Exception:
+        pass  # non-color visual (e.g. TextureVisuals) — skip silently
+        o3d_mesh.recalculate_vertex_normals()  # ensure normals exist for rendering
+    return o3d_mesh
+
+
+def _trimesh_pcd_to_o3d(pcd: trimesh.PointCloud) -> o3d.geometry.PointCloud:
+    o3d_pcd = o3d.geometry.PointCloud()
+
+    o3d_pcd.points = o3d.utility.Vector3dVector(np.asarray(pcd.vertices, dtype=np.float64))
+
+    # Colors
+    if pcd.colors is not None and len(pcd.colors):
+        o3d_pcd.colors = o3d.utility.Vector3dVector(_to_float_colors(pcd.colors))
+
+    # Normals (trimesh stores them in metadata when present)
+    if hasattr(pcd, "metadata") and "normals" in pcd.metadata:
+        normals = np.asarray(pcd.metadata["normals"], dtype=np.float64)
+        if normals.shape == (len(pcd.vertices), 3):
+            o3d_pcd.normals = o3d.utility.Vector3dVector(normals)
+
+    return o3d_pcd
+
+def expand_mesh(
+    mesh: o3d.geometry.TriangleMesh,
+    offset: float,
+) -> o3d.geometry.TriangleMesh:
+    """
+    Expand Open3D TriangleMeshes outward by a fixed offset distance.
+
+    Each vertex is displaced along its averaged (area-weighted) vertex normal.
+    The mesh must have triangles; normals are recomputed on the copy.
+
+    Parameters
+    ----------
+    mesh   : Source mesh(es).
+    offset : Distance to expand, in the same units as the mesh coordinates.
+             A negative value shrinks the mesh.
+
+    Returns
+    -------
+    New TriangleMesh(es) with vertices displaced by `offset` along their normals.
+    """
+    if isinstance(mesh, o3d.geometry.TriangleMesh):
+        mesh = [mesh]
+    expanded_meshes = []
+    for m in mesh:
+        expanded = o3d.geometry.TriangleMesh(m)          # deep copy
+        expanded.compute_vertex_normals()                   # ensure normals exist
+
+        vertices = np.asarray(expanded.vertices)
+        normals  = np.asarray(expanded.vertex_normals)
+
+        # Normalise to unit length (compute_vertex_normals already does this,
+        # but guard against degenerate faces that can produce zero-length normals)
+        norms = np.linalg.norm(normals, axis=1, keepdims=True)
+        safe_normals = np.where(norms > 1e-10, normals / norms, normals)
+
+        expanded.vertices = o3d.utility.Vector3dVector(vertices + offset * safe_normals)
+
+        # Recompute normals for the displaced geometry
+        expanded.compute_vertex_normals()
+        expanded.compute_triangle_normals()
+        expanded_meshes.append(expanded)
+
+    if len(expanded_meshes) == 1:
+        return expanded_meshes[0]
+    return expanded_meshes
+
 
 def transform_points(pts_3d: np.ndarray, T: np.ndarray) -> np.ndarray:
     """Apply a 4×4 homogeneous transform to an (N,3) array."""
@@ -457,49 +595,88 @@ def txt_pcd_to_open3d(txtPath, apply_transform=False, inverse_transform=True,
     pcd.colors  = o3d.utility.Vector3dVector(rgb.astype(np.float64))
 
     # --- Optionally apply header transform ---
-    matrix = None
+    matrix = read_transform_matrix(txtPath,
+                                    apply_unity_conversion=False)
+    T = np.linalg.inv(matrix) if inverse_transform else matrix
     if apply_transform:
-        matrix = read_transform_matrix(txtPath,
-                                       apply_unity_conversion=False)
-        T = np.linalg.inv(matrix) if inverse_transform else matrix
         pcd.transform(T)
     if apply_unity_conversion:
         pcd.transform(UNITY_TO_OPEN3D)
+        T = UNITY_TO_OPEN3D @ T
 
     print(f"Loaded {len(pcd.points)} points from {txtPath}")
-    return pcd, matrix
+    return pcd, T
+
+def load_voxelgrid_from_ply(
+    path: str,
+    voxel_size: Optional[float] = None,
+    transform: Optional[np.ndarray] = None
+) -> o3d.geometry.VoxelGrid:
+    """
+    Load a VoxelGrid saved as voxel centers in a PLY file back into an
+    open3d VoxelGrid.
+
+    Parameters
+    ----------
+    path       : Path to the PLY file containing voxel centers.
+    voxel_size : Voxel size to use. If None, it is inferred automatically
+                 from the minimum nearest-neighbour distance between centers.
+
+    Returns
+    -------
+    o3d.geometry.VoxelGrid
+    """
+    pcd = o3d.io.read_point_cloud(path)
+    if transform is not None:
+        pcd.transform(transform)
+    points = np.asarray(pcd.points)
+
+    if len(points) == 0:
+        raise ValueError(f"No points found in {path}")
+
+    if voxel_size is None:
+        voxel_size = _infer_voxel_size(points)
+        print(f"Inferred voxel size: {voxel_size:.6f}")
+
+    grid = o3d.geometry.VoxelGrid()
+    grid.voxel_size = voxel_size
+
+    # Grid origin: align to the voxel grid that produced these centers
+    # Centers are at  origin + (i + 0.5) * voxel_size, so:
+    # origin = min_center - 0.5 * voxel_size
+    grid.origin = points.min(axis=0) - 0.5 * voxel_size
+
+    has_colors = pcd.has_colors()
+    colors = np.asarray(pcd.colors) if has_colors else None
+
+    for i, center in enumerate(points):
+        voxel = o3d.geometry.Voxel()
+        # Compute integer grid index from center
+        voxel.grid_index = np.floor(
+            (center - grid.origin) / voxel_size
+        ).astype(np.int32)
+        if has_colors:
+            voxel.color = colors[i]
+        grid.add_voxel(voxel)
+
+    return grid
 
 
-def ransac_plane_trimesh(points, num_iterations=1000, distance_threshold=0.01):
-    best_plane = None
-    best_inliers = []
+def _infer_voxel_size(points: np.ndarray) -> float:
+    """
+    Estimate voxel size as the minimum nearest-neighbour distance across
+    a random subsample of points.
+    """
+    # Subsample for speed on large grids
+    n = min(len(points), 1000)
+    sample = points[np.random.choice(len(points), n, replace=False)]
 
-    for _ in range(num_iterations):
-        # Randomly pick 3 points
-        sample_indices = np.random.choice(len(points), 3, replace=False)
-        p1, p2, p3 = points[sample_indices]
+    pcd_tmp = o3d.geometry.PointCloud()
+    pcd_tmp.points = o3d.utility.Vector3dVector(sample)
+    distances = pcd_tmp.compute_nearest_neighbor_distance()
 
-        # Compute plane normal
-        normal = np.cross(p2 - p1, p3 - p1)
-        norm = np.linalg.norm(normal)
-        if norm == 0:
-            continue
-        normal /= norm
+    return float(np.min(distances))
 
-        # Plane equation: ax + by + cz + d = 0
-        d = -np.dot(normal, p1)
-
-        # Distances of all points to the plane
-        distances = np.abs(points.dot(normal) + d)
-
-        # Find inliers
-        inliers = np.where(distances < distance_threshold)[0]
-
-        if len(inliers) > len(best_inliers):
-            best_inliers = inliers
-            best_plane = (*normal, d)
-
-    return best_plane, best_inliers
 
 def visualize_pointclouds_random_colors(planes):
     """
@@ -601,7 +778,7 @@ def _convert_lineset(ls: o3d.geometry.LineSet, random_color: bool):
     return trimesh.path.Path3D(entities=entities, vertices=pts)
  
  
-def _convert_voxelgrid(vg: o3d.geometry.VoxelGrid, random_color: bool):
+def _convert_voxelgrid(vg: o3d.geometry.VoxelGrid, random_color: bool, voxel_scale_modifier: float = 1):
     """
     Represent each voxel as a small trimesh Box.
     All boxes are merged into a single Trimesh for efficiency.
@@ -610,7 +787,7 @@ def _convert_voxelgrid(vg: o3d.geometry.VoxelGrid, random_color: bool):
     if not voxels:
         return None
  
-    s    = vg.voxel_size
+    s    = vg.voxel_size * voxel_scale_modifier
     ext  = np.array([s, s, s])
     meshes = []
  
@@ -680,6 +857,7 @@ _CONVERTERS = {
 def visualise_open3d(
     geometries: Union[O3DGeometry, List[O3DGeometry]],
     random_color: bool = False,
+    voxel_scale_modifier = 1
 ) -> trimesh.Scene:
     """
     Convert one or more Open3D geometry objects into a trimesh Scene.
@@ -716,7 +894,10 @@ def visualise_open3d(
             print(f"[visualise_open3d] Unsupported type {geom_type.__name__}, skipping.")
             continue
  
-        result = converter(geom, random_color)
+        if(geom_type == o3d.geometry.VoxelGrid):
+            result = converter(geom, random_color, voxel_scale_modifier)
+        else:
+            result = converter(geom, random_color)
         if result is None:
             continue
  

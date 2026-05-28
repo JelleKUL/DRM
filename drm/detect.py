@@ -7,7 +7,7 @@ import drm
 
 import copy
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import open3d as o3d
@@ -121,6 +121,158 @@ def load_detected_boxes_as_mesh(json_path, pred_score_thr=0.3, labelColors = Tru
     # Combine meshes for visualization
     return bb_meshes
 
+
+def split_pointcloud_by_boxes(
+    pcd: o3d.geometry.PointCloud,
+    boxes: Union[o3d.geometry.TriangleMesh, o3d.geometry.OrientedBoundingBox, list],
+) -> tuple[list[o3d.geometry.PointCloud], o3d.geometry.PointCloud]:
+    if isinstance(boxes, (o3d.geometry.TriangleMesh, o3d.geometry.OrientedBoundingBox)):
+        boxes = [boxes]
+
+    points = np.asarray(pcd.points)
+    has_colors  = pcd.has_colors()
+    has_normals = pcd.has_normals()
+    colors  = np.asarray(pcd.colors)  if has_colors  else None
+    normals = np.asarray(pcd.normals) if has_normals else None
+
+    claimed = np.zeros(len(points), dtype=bool)
+    cropped_pcds: list[o3d.geometry.PointCloud] = []
+
+    for box in boxes:
+        # Accept a raw OBB/AABB or derive the OBB from a TriangleMesh
+        if isinstance(box, o3d.geometry.TriangleMesh):
+            obb = box.get_minimal_oriented_bounding_box()
+        elif isinstance(box, (o3d.geometry.OrientedBoundingBox,
+                               o3d.geometry.AxisAlignedBoundingBox)):
+            obb = box
+        else:
+            raise TypeError(f"Unsupported geometry type: {type(box)}")
+
+        cropped = pcd.crop(obb)
+        cropped_pcds.append(cropped)
+
+        # Re-use Open3D's own containment test to build the claimed mask
+        inside_idx = np.asarray(obb.get_point_indices_within_bounding_box(pcd.points))
+        claimed[inside_idx] = True
+
+    remainder_idx = np.where(~claimed)[0]
+    remainder_pcd = o3d.geometry.PointCloud()
+    remainder_pcd.points = o3d.utility.Vector3dVector(points[remainder_idx])
+    if has_colors:
+        remainder_pcd.colors  = o3d.utility.Vector3dVector(colors[remainder_idx])
+    if has_normals:
+        remainder_pcd.normals = o3d.utility.Vector3dVector(normals[remainder_idx])
+
+    return cropped_pcds, remainder_pcd
+
+
+def detect_planes(
+    pcd: o3d.geometry.PointCloud,
+    min_points: int = 100,
+    num_iterations: int = 1000,
+    distance_threshold: float = 0.01,
+) -> tuple[list[o3d.geometry.PointCloud], list[np.ndarray], Optional[o3d.geometry.PointCloud]]:
+    """
+    Iteratively detect planes in a PointCloud using RANSAC, removing each
+    detected plane before searching for the next.
+
+    Parameters
+    ----------
+    pcd                : Input PointCloud.
+    min_points         : Minimum inlier count to accept a plane.
+    num_iterations     : RANSAC iterations per plane fit.
+    distance_threshold : Max point-to-plane distance to count as an inlier.
+
+    Returns
+    -------
+    planes       : List of PointClouds, one per detected plane, in detection order.
+    plane_models : List of [a, b, c, d] arrays defining each plane as ax+by+cz+d=0.
+    remainder_pc : PointCloud of leftover points, or None if none remain.
+    """
+    has_colors  = pcd.has_colors()
+    has_normals = pcd.has_normals()
+
+    remaining_points  = np.asarray(pcd.points).copy()
+    remaining_colors  = np.asarray(pcd.colors).copy()  if has_colors  else None
+    remaining_normals = np.asarray(pcd.normals).copy() if has_normals else None
+
+    planes: list[o3d.geometry.PointCloud] = []
+    plane_models: list[np.ndarray] = []
+
+    while len(remaining_points) >= min_points:
+        tmp = o3d.geometry.PointCloud()
+        tmp.points = o3d.utility.Vector3dVector(remaining_points)
+
+        plane_model, inliers = tmp.segment_plane(
+            distance_threshold=distance_threshold,
+            ransac_n=3,
+            num_iterations=num_iterations,
+        )
+
+        if len(inliers) < min_points:
+            print("No more large planes detected.")
+            break
+
+        plane_models.append(np.asarray(plane_model))  # [a, b, c, d]
+
+        plane_pc = o3d.geometry.PointCloud()
+        plane_pc.points = o3d.utility.Vector3dVector(remaining_points[inliers])
+        if has_colors  and remaining_colors  is not None:
+            plane_pc.colors  = o3d.utility.Vector3dVector(remaining_colors[inliers])
+        if has_normals and remaining_normals is not None:
+            plane_pc.normals = o3d.utility.Vector3dVector(remaining_normals[inliers])
+        planes.append(plane_pc)
+
+        mask = np.ones(len(remaining_points), dtype=bool)
+        mask[inliers] = False
+        remaining_points = remaining_points[mask]
+        if remaining_colors  is not None: remaining_colors  = remaining_colors[mask]
+        if remaining_normals is not None: remaining_normals = remaining_normals[mask]
+
+    if len(remaining_points) > 0:
+        remainder_pc = o3d.geometry.PointCloud()
+        remainder_pc.points = o3d.utility.Vector3dVector(remaining_points)
+        if remaining_colors  is not None:
+            remainder_pc.colors  = o3d.utility.Vector3dVector(remaining_colors)
+        if remaining_normals is not None:
+            remainder_pc.normals = o3d.utility.Vector3dVector(remaining_normals)
+    else:
+        remainder_pc = None
+
+    print(f"Extracted {len(planes)} planes.")
+    return planes, plane_models, remainder_pc
+
+
+def ransac_plane_trimesh(points, num_iterations=1000, distance_threshold=0.01):
+    best_plane = None
+    best_inliers = []
+
+    for _ in range(num_iterations):
+        # Randomly pick 3 points
+        sample_indices = np.random.choice(len(points), 3, replace=False)
+        p1, p2, p3 = points[sample_indices]
+
+        # Compute plane normal
+        normal = np.cross(p2 - p1, p3 - p1)
+        norm = np.linalg.norm(normal)
+        if norm == 0:
+            continue
+        normal /= norm
+
+        # Plane equation: ax + by + cz + d = 0
+        d = -np.dot(normal, p1)
+
+        # Distances of all points to the plane
+        distances = np.abs(points.dot(normal) + d)
+
+        # Find inliers
+        inliers = np.where(distances < distance_threshold)[0]
+
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            best_plane = (*normal, d)
+
+    return best_plane, best_inliers
 
 """
 symmetry_detection.py
