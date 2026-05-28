@@ -4,6 +4,7 @@ import open3d as o3d
 from typing import Tuple, List
 from scipy.spatial import Delaunay
 import trimesh
+import json
 
 
 def combine_geometry(ogGeometry: o3d.geometry.PointCloud, newGeometry: o3d.geometry.PointCloud, newScannerPos: np.ndarray,
@@ -116,25 +117,107 @@ def filter_pcd_by_distance(sourcePcd: o3d.geometry.PointCloud,
     inside_idx = np.where(dists < maxDistance)[0]
     return sourcePcd.select_by_index(inside_idx), sourcePcd.select_by_index(inside_idx, invert=True)
 
+def points_inside_obb(points: np.ndarray, obb_corners: np.ndarray) -> np.ndarray:
+    """
+    Returns a boolean mask for points lying inside the OBB defined by 8 corner points.
+
+    The OBB axes and half-extents are recovered by SVD on the centered corners,
+    so the input does not need to be axis-aligned.
+
+    Parameters
+    ----------
+    points      : (N, 3) array of points to test
+    obb_corners : (8, 3) array of OBB corner points
+
+    Returns
+    -------
+    mask : (N,) boolean array, True where point is inside the OBB
+    """
+    center = obb_corners.mean(axis=0)
+    centered = obb_corners - center
+    # SVD gives us the three principal axes of the box
+    _, _, Vt = np.linalg.svd(centered)   # Vt rows are the box axes
+
+    # Project all points into the OBB local frame
+    pts_local      = (points - center) @ Vt.T
+    corners_local  = centered @ Vt.T
+
+    lo = corners_local.min(axis=0)
+    hi = corners_local.max(axis=0)
+
+    return np.all((pts_local >= lo) & (pts_local <= hi), axis=1)
+
+
+def build_occlusion_grid_per_object(
+    reference: o3d.geometry.PointCloud,
+    scanner_pos: np.ndarray,
+    bounding_boxes: list[dict],
+    voxel_size: float = 0.05,
+) -> dict[str, tuple[o3d.geometry.VoxelGrid, o3d.geometry.VoxelGrid]]:
+    """
+    Builds occupied and occluded voxel grids for each labelled object in the scene.
+
+    For every bounding box in the JSON, the reference point cloud is masked to
+    the points inside that box, and build_occlusion_grid is called on that subset.
+    The occlusion grid therefore reflects only the shadow cast by that object.
+
+    Parameters
+    ----------
+    reference   : full scene point cloud
+    scanner_pos : world-space scanner position
+    bounding_boxes : list of bounding box definitions
+    voxel_size  : edge length of each voxel in metres
+
+    Returns
+    -------
+    results : dict mapping object ID -> (occupied_grid, occluded_grid)
+              Objects with no points inside their bounding box are skipped.
+    """
+    all_points = np.asarray(reference.points)
+    boxes      = bounding_boxes
+    results    = {}
+
+    for box in boxes:
+        obj_id  = box["id"]
+        corners = box["points"]
+
+        # --- mask reference cloud to this object's bounding box ---
+        mask = points_inside_obb(all_points, corners)
+        if mask.sum() == 0:
+            print(f"[{obj_id}] No points inside bounding box, skipping.")
+            continue
+
+        obj_pcd        = o3d.geometry.PointCloud()
+        obj_pcd.points = o3d.utility.Vector3dVector(all_points[mask])
+
+        print(f"[{obj_id}] {mask.sum()} points — building occlusion grid…")
+        occupied_grid, occluded_grid = build_occlusion_grid(
+            obj_pcd, scanner_pos, voxel_size
+        )
+        results[obj_id] = (occupied_grid, occluded_grid)
+
+    return results
+
 def build_occlusion_grid(
     reference: o3d.geometry.PointCloud,
     scanner_pos: np.ndarray,
     voxel_size: float = 0.05,
+    obb_corners: np.ndarray | None = None,  # (8,3) corners in world space
 ) -> tuple[o3d.geometry.VoxelGrid, o3d.geometry.VoxelGrid]:
     """
     Builds occupied and occluded voxel grids from a reference point cloud.
 
-    Internally shifts the cloud so the scanner is at the origin, rotates into
-    the OBB local frame for compact voxelization, then for every voxel in the
-    grid that is NOT occupied, marches from the scanner toward that voxel to
-    determine whether an occupied voxel blocks the line of sight (occlusion).
-    Both grids are returned in world space.
+    If obb_corners is provided, that box defines the voxelization frame and
+    grid extent. Otherwise the minimal OBB of the (scanner-shifted) cloud is
+    used as before.
 
     Parameters
     ----------
-    reference   : point cloud that defines the geometry (e.g. var_pcd)
+    reference   : point cloud that defines the geometry
     scanner_pos : world-space position of the scanner that captured reference
     voxel_size  : edge length of each voxel in metres
+    obb_corners : optional (8,3) world-space corners of a pre-computed OBB.
+                  When supplied the cloud's own OBB is never computed.
 
     Returns
     -------
@@ -143,24 +226,42 @@ def build_occlusion_grid(
     """
     pts_shifted = np.asarray(reference.points) - scanner_pos
 
-    shifted_pcd        = o3d.geometry.PointCloud()
-    shifted_pcd.points = o3d.utility.Vector3dVector(pts_shifted)
-    obb    = shifted_pcd.get_minimal_oriented_bounding_box()
-    R      = np.asarray(obb.R)
-    center = np.asarray(obb.center)
+    if obb_corners is not None:
+        # --- derive frame from the supplied box corners ---
+        # Shift corners into scanner-centred space (same as pts_shifted)
+        corners_shifted = obb_corners - scanner_pos
+        center          = corners_shifted.mean(axis=0)
+        centered        = corners_shifted - center
+        _, _, Vt        = np.linalg.svd(centered)
+        R               = Vt  # rows are the box axes (same convention as obb.R columns)
 
-    pts_local = (pts_shifted - center) @ R
-    min_bound = pts_local.min(axis=0)
-    max_bound = pts_local.max(axis=0)
+        pts_local      = (pts_shifted - center) @ R.T
+        corners_local  = centered @ R.T
+        min_bound      = corners_local.min(axis=0)
+        max_bound      = corners_local.max(axis=0)
+    else:
+        # --- original path: fit OBB to the shifted cloud ---
+        shifted_pcd        = o3d.geometry.PointCloud()
+        shifted_pcd.points = o3d.utility.Vector3dVector(pts_shifted)
+        obb    = shifted_pcd.get_minimal_oriented_bounding_box()
+        R      = np.asarray(obb.R)
+        center = np.asarray(obb.center)
+
+        pts_local = (pts_shifted - center) @ R
+        min_bound = pts_local.min(axis=0)
+        max_bound = pts_local.max(axis=0)
+
     grid_size = np.floor((max_bound - min_bound) / voxel_size).astype(int) + 1
 
     voxel_indices = np.floor((pts_local - min_bound) / voxel_size).astype(int)
+    # Clip to grid bounds — points outside the supplied box are clamped out
+    valid_mask    = np.all((voxel_indices >= 0) & (voxel_indices < grid_size), axis=1)
+    voxel_indices = voxel_indices[valid_mask]
     occupied_set  = set(map(tuple, voxel_indices))
 
-    origin_local = (np.zeros(3) - center) @ R
+    origin_local = (np.zeros(3) - center) @ (R.T if obb_corners is not None else R)
     origin_voxel = (origin_local - min_bound) / voxel_size
 
-    # Build the full set of candidate voxels (everything not occupied)
     all_indices = [
         (x, y, z)
         for x in range(grid_size[0])
@@ -171,7 +272,7 @@ def build_occlusion_grid(
     occluded_set = set()
     for voxel in all_indices:
         if voxel in occupied_set:
-            continue  # occupied voxels are never occluded
+            continue
 
         voxel_center = np.array(voxel, dtype=float) + 0.5
         ray_dir      = voxel_center - origin_voxel
@@ -180,12 +281,10 @@ def build_occlusion_grid(
             continue
         ray_dir_n = ray_dir / ray_length
 
-        # March from scanner toward this voxel in steps of ~half a voxel.
-        # If we hit an occupied voxel before arriving, this voxel is occluded.
-        step  = 0.5                  # sub-voxel step to avoid skipping thin geometry
-        t     = step
+        step     = 0.5
+        t        = step
         occluded = False
-        while t < ray_length - step: # stop just before the target voxel
+        while t < ray_length - step:
             sample = np.floor(origin_voxel + t * ray_dir_n).astype(int)
             if np.any(sample < 0) or np.any(sample >= grid_size):
                 break
@@ -198,9 +297,15 @@ def build_occlusion_grid(
             occluded_set.add(voxel)
 
     def set_to_voxel_grid(voxel_set: set, color: list) -> o3d.geometry.VoxelGrid:
-        indices       = np.array(list(voxel_set))
-        centres_world = (indices + 0.5) * voxel_size + min_bound
-        centres_world = centres_world @ R.T + center + scanner_pos
+        if not voxel_set:
+            return o3d.geometry.VoxelGrid()          # return empty grid gracefully
+
+        indices       = np.array(list(voxel_set), dtype=np.float64)  # guaranteed (N,3)
+        centres_local = (indices + 0.5) * voxel_size + min_bound
+        if obb_corners is not None:
+            centres_world = centres_local @ R + center + scanner_pos
+        else:
+            centres_world = centres_local @ R.T + center + scanner_pos
         pcd           = o3d.geometry.PointCloud()
         pcd.points    = o3d.utility.Vector3dVector(centres_world)
         pcd.paint_uniform_color(color)

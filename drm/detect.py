@@ -13,6 +13,26 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
 
+def load_gt_boxes_raw(json_path: str) -> list[dict]:
+    """
+    Parse bounding boxes from JSON, returning raw corner points and IDs.
+    Applies the same UNITY2TRIMESH_T transform used in load_gt_json_boxes_as_mesh.
+
+    Returns list of {"id": str, "points": np.ndarray (8,3)}
+    """
+    with open(json_path) as f:
+        data = json.load(f)
+
+    boxes = []
+    for box in data["boxes"]:
+        pts = np.array([[p["x"], p["y"], p["z"]] for p in box["boundingPoints"]])
+        # Apply the same coordinate transform used in the mesh loader
+        pts_h = np.hstack([pts, np.ones((len(pts), 1))])
+        pts_transformed = (drm.UNITY2TRIMESH_T @ pts_h.T).T[:, :3]
+        boxes.append({"id": box["id"], "points": pts_transformed})
+
+    return boxes
+
 def load_gt_json_boxes_as_mesh(json_path, randomcolors = True):
     """
     Load detection results from a JSON file and convert them to a mesh format.
@@ -585,25 +605,13 @@ def symmetry_geometries(
     show_plane:     bool  = True,
     show_reflected: bool  = True,
 ) -> List[o3d.geometry.Geometry]:
-    """
-    Build Open3D geometries visualising the symmetry result.
- 
-    Returns a list ready for o3d.visualization.draw_geometries() or your
-    existing visualise_open3d_pointclouds() helper.
- 
-    Geometries
-    ----------
-    • Red   LineSet       – symmetry axis arrow spanning the cloud
-    • Orange TriangleMesh – symmetry plane quad
-    • Green PointCloud    – reflected copy of the original cloud
-    """
     geoms: List[o3d.geometry.Geometry] = []
- 
+
     pts    = np.asarray(pcd.points)
     n      = result.plane_normal
     p0     = result.plane_point
     extent = np.linalg.norm(pts - pts.mean(axis=0), axis=1).max()
- 
+
     # ── Symmetry axis (LineSet) ─────────────────────────────────────────────────
     line_pts = np.array([p0 - n * extent, p0 + n * extent])
     ls = o3d.geometry.LineSet(
@@ -612,18 +620,27 @@ def symmetry_geometries(
     )
     ls.colors = o3d.utility.Vector3dVector([list(axis_color)])
     geoms.append(ls)
- 
+
     # ── Symmetry plane (TriangleMesh quad) ──────────────────────────────────────
     if show_plane:
         ref = np.array([1, 0, 0]) if abs(n[0]) < 0.9 else np.array([0, 1, 0])
         u   = ref - (ref @ n) * n;  u /= np.linalg.norm(u)
         v   = np.cross(n, u)
- 
+
+        # Project every point onto the two in-plane axes
+        centered  = pts - p0
+        coords_u  = centered @ u
+        coords_v  = centered @ v
+
+        # Bound the quad tightly to the point cloud's bounding box
+        u_min, u_max = coords_u.min(), coords_u.max()
+        v_min, v_max = coords_v.min(), coords_v.max()
+
         corners = np.array([
-            p0 + extent * ( u + v),
-            p0 + extent * (-u + v),
-            p0 + extent * (-u - v),
-            p0 + extent * ( u - v),
+            p0 + u_max * u + v_max * v,
+            p0 + u_min * u + v_max * v,
+            p0 + u_min * u + v_min * v,
+            p0 + u_max * u + v_min * v,
         ])
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices  = o3d.utility.Vector3dVector(corners)
@@ -631,7 +648,7 @@ def symmetry_geometries(
         mesh.paint_uniform_color(list(plane_color))
         mesh.compute_vertex_normals()
         geoms.append(mesh)
- 
+
     # ── Reflected cloud ─────────────────────────────────────────────────────────
     if show_reflected:
         ref_pts = _reflect(pts, p0, n)
@@ -639,7 +656,7 @@ def symmetry_geometries(
         pcd_ref.points = o3d.utility.Vector3dVector(ref_pts)
         pcd_ref.paint_uniform_color(list(reflect_color))
         geoms.append(pcd_ref)
- 
+
     return geoms
  
  

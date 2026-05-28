@@ -261,6 +261,17 @@ def txt_pcd_to_ply(txt_path, ply_path):
         for r in rows:
             f.write(" ".join(r) + "\n")
 
+def open3d_to_bin(pcd, bin_path):
+    points = np.asarray(pcd.points)
+    colors = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() else np.zeros((len(points), 3), dtype=np.uint8)
+
+    # Combine XYZ and RGB into (N,6) array
+    data = np.hstack([points.astype(np.float32), colors])
+
+    # Save to .bin
+    data.tofile(bin_path)
+    print(f"Saved {len(points)} points to {bin_path}")
+    return bin_path
 
 def txt_pcd_to_bin(txtPath, binPath = "", rotateX = False, containsNormals = False, mirrorX = False,mirrorY = False,mirrorZ = False):
     #if binPath is empty, save at the same location
