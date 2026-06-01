@@ -166,7 +166,7 @@ def split_pointcloud_by_boxes(
     return cropped_pcds, remainder_pcd
 
 
-def detect_planes(
+def detect_planes_iteratively(
     pcd: o3d.geometry.PointCloud,
     min_points: int = 100,
     num_iterations: int = 1000,
@@ -273,6 +273,9 @@ def ransac_plane_trimesh(points, num_iterations=1000, distance_threshold=0.01):
             best_plane = (*normal, d)
 
     return best_plane, best_inliers
+
+
+
 
 """
 symmetry_detection.py

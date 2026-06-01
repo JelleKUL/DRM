@@ -71,30 +71,29 @@ def _to_float_colors(colors: np.ndarray) -> np.ndarray:
 def _trimesh_mesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
     o3d_mesh = o3d.geometry.TriangleMesh()
 
-    o3d_mesh.vertices  = o3d.utility.Vector3dVector(np.asarray(mesh.vertices,  dtype=np.float64))
-    o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces,     dtype=np.int32))
+    o3d_mesh.vertices  = o3d.utility.Vector3dVector(np.array(mesh.vertices,  dtype=np.float64))
+    o3d_mesh.triangles = o3d.utility.Vector3iVector(np.array(mesh.faces,     dtype=np.int32))
 
-    # Vertex normals
     if mesh.vertex_normals is not None and len(mesh.vertex_normals):
         o3d_mesh.vertex_normals = o3d.utility.Vector3dVector(
-            np.asarray(mesh.vertex_normals, dtype=np.float64)
+            np.array(mesh.vertex_normals, dtype=np.float64)
         )
 
-    # Triangle normals
     if mesh.face_normals is not None and len(mesh.face_normals):
         o3d_mesh.triangle_normals = o3d.utility.Vector3dVector(
-            np.asarray(mesh.face_normals, dtype=np.float64)
+            np.array(mesh.face_normals, dtype=np.float64)
         )
 
-    # Vertex colors (stored in mesh.visual for ColorVisuals)
     try:
         if hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors is not None:
-            vc = mesh.visual.vertex_colors          # (N, 4) uint8
+            vc = mesh.visual.vertex_colors
             if len(vc) == len(mesh.vertices):
-                o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(_to_float_colors(vc))
+                o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(
+                    np.array(_to_float_colors(vc), dtype=np.float64)
+                )
     except Exception:
-        pass  # non-color visual (e.g. TextureVisuals) — skip silently
-        o3d_mesh.recalculate_vertex_normals()  # ensure normals exist for rendering
+        pass
+
     return o3d_mesh
 
 
@@ -180,6 +179,8 @@ def o3d_mesh_to_trimesh(mesh: o3d.geometry.TriangleMesh) -> trimesh.Trimesh:
 
 def o3d_pointcloud_to_trimesh(pcd: o3d.geometry.PointCloud) -> trimesh.Trimesh:
     
+    if(not pcd.has_points()):
+        return None
     return trimesh.PointCloud(
         vertices=np.asarray(pcd.points),
         vertex_colors=np.asarray(pcd.colors) if pcd.has_colors() else None
@@ -730,27 +731,48 @@ def _convert_pointcloud(pcd: o3d.geometry.PointCloud, random_color: bool):
  
  
 def _convert_trianglemesh(mesh: o3d.geometry.TriangleMesh, random_color: bool):
+    from PIL import Image
+
     verts = np.asarray(mesh.vertices).astype(np.float32)
     faces = np.asarray(mesh.triangles)
- 
-    if random_color:
-        color = _random_rgba()
-        vertex_colors = np.tile(color, (len(verts), 1))
-    elif mesh.has_vertex_colors():
-        rgb   = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8)
-        vertex_colors = np.hstack([rgb, np.full((len(rgb), 1), 255, dtype=np.uint8)])
-    else:
-        vertex_colors = None
- 
-    kwargs = dict(vertices=verts, faces=faces)
-    if vertex_colors is not None:
-        kwargs["vertex_colors"] = vertex_colors
- 
-    tm = trimesh.Trimesh(**kwargs)
- 
+
+    tm = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
     if mesh.has_vertex_normals():
         tm.vertex_normals = np.asarray(mesh.vertex_normals).astype(np.float32)
- 
+
+    # --- texture (highest priority, skip if random_color) ---
+    has_texture = (
+        not random_color
+        and mesh.has_textures()
+        and mesh.has_triangle_uvs()
+        and len(mesh.textures) > 0
+    )
+
+    if has_texture:
+        uvs_flat = np.asarray(mesh.triangle_uvs)   # (F*3, 2)
+
+        # Average per-triangle-vertex UVs down to per-vertex UVs for trimesh
+        uv_accum = np.zeros((len(verts), 2), dtype=np.float64)
+        uv_count = np.zeros(len(verts),      dtype=np.int32)
+        for fi, tri in enumerate(faces):
+            for vi, vert_idx in enumerate(tri):
+                uv_accum[vert_idx] += uvs_flat[fi * 3 + vi]
+                uv_count[vert_idx] += 1
+        vertex_uvs = uv_accum / np.maximum(uv_count[:, None], 1)
+
+        pil_image = Image.fromarray(np.asarray(mesh.textures[0]))
+        material  = trimesh.visual.texture.SimpleMaterial(image=pil_image)
+        tm.visual = trimesh.visual.TextureVisuals(uv=vertex_uvs, material=material)
+
+    elif random_color:
+        color = _random_rgba()
+        tm.visual.vertex_colors = np.tile(color, (len(verts), 1))
+
+    elif mesh.has_vertex_colors():
+        rgb = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8)
+        tm.visual.vertex_colors = np.hstack([rgb, np.full((len(rgb), 1), 255, dtype=np.uint8)])
+
     return tm
  
  
@@ -887,6 +909,12 @@ def visualise_open3d(
     counts  = {}   # track per-type index for unique node names
  
     for geom in geometries:
+        # skip empty o3d geometries before converting
+        if isinstance(geom, o3d.geometry.PointCloud) and len(geom.points) == 0:
+            continue
+        if isinstance(geom, o3d.geometry.TriangleMesh) and len(geom.vertices) == 0:
+            continue
+        # ... rest of conversion
         geom_type = type(geom)
         converter = _CONVERTERS.get(geom_type)
  
