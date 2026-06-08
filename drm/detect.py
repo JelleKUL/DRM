@@ -752,13 +752,14 @@ def detect_multi_symmetry_o3d(
 # ═══════════════════════════════════════════════════════════════════════════════
  
 def symmetry_geometries(
-    result:         SymmetryResult,
-    pcd:            o3d.geometry.PointCloud,
-    axis_color:     Tuple = (1.0, 0.0, 0.0),
-    plane_color:    Tuple = (1.0, 0.5, 0.0),
-    reflect_color:  Tuple = (0.0, 0.8, 0.4),
-    show_plane:     bool  = True,
-    show_reflected: bool  = True,
+    result:               SymmetryResult,
+    pcd:                  o3d.geometry.PointCloud,
+    axis_color:           Tuple = (1.0, 0.0, 0.0),
+    plane_color:          Tuple = (1.0, 0.5, 0.0),
+    reflect_color:        Tuple = (0.0, 0.8, 0.4),
+    show_plane:           bool  = True,
+    show_reflected:       bool  = True,
+    show_reflected_color: bool  = False,
 ) -> List[o3d.geometry.Geometry]:
     geoms: List[o3d.geometry.Geometry] = []
 
@@ -776,36 +777,65 @@ def symmetry_geometries(
     ls.colors = o3d.utility.Vector3dVector([list(axis_color)])
     geoms.append(ls)
 
-    # ── Symmetry plane (TriangleMesh quad) ──────────────────────────────────────
+# ── Symmetry plane (quad edges LineSet) ─────────────────────────────────────
     if show_plane:
         ref = np.array([1, 0, 0]) if abs(n[0]) < 0.9 else np.array([0, 1, 0])
         u   = ref - (ref @ n) * n;  u /= np.linalg.norm(u)
         v   = np.cross(n, u)
 
-        # Project every point onto the two in-plane axes
         centered  = pts - p0
         coords_u  = centered @ u
         coords_v  = centered @ v
 
-        # Bound the quad tightly to the point cloud's bounding box
         u_min, u_max = coords_u.min(), coords_u.max()
         v_min, v_max = coords_v.min(), coords_v.max()
 
         corners = np.array([
-            p0 + u_max * u + v_max * v,
-            p0 + u_min * u + v_max * v,
-            p0 + u_min * u + v_min * v,
-            p0 + u_max * u + v_min * v,
+            p0 + u_max * u + v_max * v,   # 0 — top-right
+            p0 + u_min * u + v_max * v,   # 1 — top-left
+            p0 + u_min * u + v_min * v,   # 2 — bottom-left
+            p0 + u_max * u + v_min * v,   # 3 — bottom-right
         ])
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices  = o3d.utility.Vector3dVector(corners)
-        mesh.triangles = o3d.utility.Vector3iVector([[0, 1, 2], [0, 2, 3]])
-        mesh.paint_uniform_color(list(plane_color))
-        mesh.compute_vertex_normals()
-        geoms.append(mesh)
+
+        quad_ls = o3d.geometry.LineSet(
+            points = o3d.utility.Vector3dVector(corners),
+            lines  = o3d.utility.Vector2iVector([[0, 1], [1, 2], [2, 3], [3, 0]]),
+        )
+        quad_ls.colors = o3d.utility.Vector3dVector([list(plane_color)] * 4)
+        geoms.append(quad_ls)
 
     # ── Reflected cloud ─────────────────────────────────────────────────────────
-    if show_reflected:
+    if show_reflected_color:
+        # Split original points by which side of the plane they sit on,
+        # colour each side differently (blue / red), then add the reflected cloud.
+        signed_dist = (pts - p0) @ n          # positive = "front", negative = "back"
+
+        # ── Original cloud: blue on the positive side, red on the negative side ──
+        colors_orig = np.where(
+            (signed_dist >= 0)[:, None],       # broadcast over RGB
+            [0.0, 0.0, 1.0],                   # blue  – positive side
+            [1.0, 0.0, 0.0],                   # red   – negative side
+        )
+        pcd_colored = o3d.geometry.PointCloud()
+        pcd_colored.points = o3d.utility.Vector3dVector(pts)
+        pcd_colored.colors = o3d.utility.Vector3dVector(colors_orig)
+        geoms.append(pcd_colored)
+
+        # ── Reflected cloud: mirrored colors (what was blue → red, and vice-versa) ──
+        if show_reflected:
+            ref_pts = _reflect(pts, p0, n)
+            colors_ref = np.where(
+                (signed_dist >= 0)[:, None],
+                [1.0, 0.0, 0.0],               # reflected positive → now red
+                [0.0, 0.0, 1.0],               # reflected negative → now blue
+            )
+            pcd_ref = o3d.geometry.PointCloud()
+            pcd_ref.points = o3d.utility.Vector3dVector(ref_pts)
+            pcd_ref.colors = o3d.utility.Vector3dVector(colors_ref)
+            geoms.append(pcd_ref)
+
+    elif show_reflected:
+        # Original behaviour: reflected cloud with uniform reflect_color
         ref_pts = _reflect(pts, p0, n)
         pcd_ref = o3d.geometry.PointCloud()
         pcd_ref.points = o3d.utility.Vector3dVector(ref_pts)

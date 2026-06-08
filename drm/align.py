@@ -12,10 +12,10 @@ import time
 def draw_registration_result(source, target, transformation = np.eye(4)):
     source_temp = copy.deepcopy(source)
     target_temp = copy.deepcopy(target)
-    source_temp.paint_uniform_color([1, 0.706, 0])
-    target_temp.paint_uniform_color([0, 0.651, 0.929])
+    source_temp.paint_uniform_color([211/255, 79/255, 60/255])  # Red
+    target_temp.paint_uniform_color([0, 64/255, 200/255])  # Blue
     source_temp.transform(transformation)
-    return drm.visualise_open3d_pointclouds([source_temp, target_temp])
+    return drm.visualise_open3d([source_temp, target_temp])
 
 def preprocess_point_cloud(pcd, voxel_size):
     pcd_down = pcd.voxel_down_sample(voxel_size)
