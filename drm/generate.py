@@ -201,8 +201,7 @@ def filter_planes_by_points(
     distance_threshold: float = 0.01,
     min_points: int = 10,
 ) -> tuple[list[o3d.geometry.TriangleMesh], list[o3d.geometry.PointCloud]]:
-    kept_meshes = []
-    kept_pcds   = []
+    scored = []
 
     for mesh in plane_meshes:
         counts = []
@@ -214,8 +213,12 @@ def filter_planes_by_points(
         best_plane  = int(np.argmax(counts))
 
         if total_count >= min_points:
-            kept_meshes.append(mesh)
-            kept_pcds.append(plane_pcds[best_plane])
+            scored.append((total_count, mesh, plane_pcds[best_plane]))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    kept_meshes = [m for _, m, _ in scored]
+    kept_pcds   = [p for _, _, p in scored]
 
     print(f"Kept {len(kept_meshes)}/{len(plane_meshes)} fragments.")
     return kept_meshes, kept_pcds
@@ -763,7 +766,7 @@ def apply_texture_to_planes(
     return result
 
 def draw_plane_corners_on_pano(
-    plane_meshes: list[o3d.geometry.TriangleMesh],
+    plane_meshes: list[o3d.geometry.TriangleMesh | o3d.geometry.PointCloud],
     pano_image:   np.ndarray,
     transform:    np.ndarray,
     radius:       int = 10,
@@ -794,10 +797,18 @@ def draw_plane_corners_on_pano(
         (255,   0, 255),
         (  0, 255, 255),
     ]
+
     if not isinstance(plane_meshes, list):
         plane_meshes = [plane_meshes]
-    for i, mesh in enumerate(plane_meshes):
-        verts = np.asarray(mesh.vertices, dtype=np.float64)
+
+    for i, geometry in enumerate(plane_meshes):
+        if isinstance(geometry, o3d.geometry.PointCloud):
+            verts = np.asarray(geometry.points, dtype=np.float64)
+        elif isinstance(geometry, o3d.geometry.TriangleMesh):
+            verts = np.asarray(geometry.vertices, dtype=np.float64)
+        else:
+            raise TypeError(f"Unsupported geometry type: {type(geometry)}")
+
         color = colors[i % len(colors)]
 
         uv = drm.transform_xyz_to_uv(verts, tMat)     # (V, 2)
@@ -810,10 +821,161 @@ def draw_plane_corners_on_pano(
                 fill=color, outline=(0, 0, 0),
             )
 
-        print(f"Plane {i}: {len(verts)} verts, color={color}")
+        print(f"Geometry {i} ({type(geometry).__name__}): {len(verts)} points, color={color}")
 
     return np.array(canvas)
 
+
+def project_points_to_pano(
+    points: np.ndarray,
+    pano_wh: tuple[int, int],
+    *,
+    camera_center: np.ndarray | None = None,
+    camera_rotation: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Project 3-D world points onto an equirectangular panorama using the
+    same coordinate convention as ``pano_to_ply.py``:
+ 
+        yaw   = (1 - u/W) * 2π   →  u=0  ≡  X-axis  (left edge)
+        pitch = (0.5 - v/H) * π  →  v=0  ≡  top      (Z-up)
+ 
+    The inverse mapping (world → pixel) is therefore:
+ 
+        yaw   = atan2(Y_cam, X_cam)           ∈ (-π, π]
+        pitch = arcsin(Z_cam / r)             ∈ [-π/2, π/2]
+ 
+        u = (1 - yaw  / (2π)) mod 1           normalised ∈ [0, 1)
+        v =  0.5 - pitch / π                  normalised ∈ [0, 1]
+ 
+    Parameters
+    ----------
+    points : (N, 3) float array
+        3-D points in **world** coordinates (same frame as the PLY).
+ 
+    pano_wh : (W, H)
+        Width and height of the target panorama in pixels.
+ 
+    camera_center : (3,) float array, optional
+        World-space camera centre **C** (the ``t`` in R·(p - t)).
+        When the point cloud was created *without* ``--apply_transform``
+        it is already in camera-local coords, so leave this as ``None``.
+ 
+    camera_rotation : (3, 3) float array, optional
+        Camera-to-world rotation matrix **R** from the pose file.
+        Pass the *same* matrix returned by ``read_pose()`` when
+        ``apply_transform`` was used.  The inverse (world → camera)
+        is computed internally.
+ 
+    Returns
+    -------
+    uv : (N, 2) float array
+        Normalised UV coordinates in [0, 1] × [0, 1].
+        Multiply by (W-1, H-1) to get pixel coordinates.
+        Points behind the camera (r ≈ 0) receive ``nan``.
+    """
+    points = np.asarray(points, dtype=np.float64)   # (N, 3)
+ 
+    # ------------------------------------------------------------------
+    # 1.  Transform world → camera-local  (iff pose is provided)
+    # ------------------------------------------------------------------
+    if camera_center is not None or camera_rotation is not None:
+        if camera_center is None or camera_rotation is None:
+            raise ValueError(
+                "Provide both camera_center and camera_rotation, or neither."
+            )
+        C = np.asarray(camera_center,  dtype=np.float64)   # (3,)
+        R = np.asarray(camera_rotation, dtype=np.float64)  # (3, 3)  cam→world
+        # camera-local = R^T · (p - C)
+        pts_cam = (points - C) @ R   # R^T applied as right-multiply
+    else:
+        pts_cam = points
+ 
+    X = pts_cam[:, 0]
+    Y = pts_cam[:, 1]
+    Z = pts_cam[:, 2]
+ 
+    # ------------------------------------------------------------------
+    # 2.  Cartesian → spherical
+    #     Convention matches pano_to_ply.py:
+    #       X = cos(pitch)·cos(yaw)
+    #       Y = cos(pitch)·sin(yaw)
+    #       Z = sin(pitch)
+    # ------------------------------------------------------------------
+    r = np.sqrt(X**2 + Y**2 + Z**2)
+ 
+    # Mask degenerate points
+    valid = r > 1e-9
+    yaw   = np.where(valid, np.arctan2(Y, X), np.nan)   # atan2(Y,X): (-π, π]
+    pitch = np.where(valid, np.arcsin(np.clip(Z / np.where(valid, r, 1.0),
+                                              -1.0, 1.0)), np.nan)
+ 
+    # ------------------------------------------------------------------
+    # 3.  Spherical → normalised UV
+    #     Inverted from:
+    #       yaw   = (1 - u/W) * 2π   →   u/W  =  1 - yaw/(2π)
+    #       pitch = (0.5 - v/H) * π  →   v/H  =  0.5 - pitch/π
+    # ------------------------------------------------------------------
+    u_norm = (1.0 - yaw   / (2.0 * np.pi)) % 1.0   # wrap to [0, 1)
+    v_norm =  0.5 - pitch / np.pi                   # [0, 1]
+ 
+    uv = np.stack([u_norm, v_norm], axis=-1)        # (N, 2)
+    uv[~valid] = np.nan
+ 
+    return uv.astype(np.float32)
+ 
+ 
+# ---------------------------------------------------------------------------
+# Convenience: draw projected points onto a panorama image
+# ---------------------------------------------------------------------------
+ 
+def draw_points_on_pano(
+    points:  np.ndarray,
+    pano_image: np.ndarray,
+    *,
+    camera_center:   np.ndarray | None = None,
+    camera_rotation: np.ndarray | None = None,
+    color:   tuple[int, int, int] = (255, 0, 0),
+    radius:  int = 5,
+) -> np.ndarray:
+    """
+    Project ``points`` onto ``pano_image`` and paint filled circles.
+ 
+    Parameters
+    ----------
+    points : (N, 3) float array  –  world-space 3-D points
+    pano_image : (H, W, 3) uint8 numpy array
+    camera_center / camera_rotation : see ``project_points_to_pano``
+    color  : RGB fill colour for every dot
+    radius : circle radius in pixels
+ 
+    Returns
+    -------
+    Annotated copy of ``pano_image`` as a numpy array.
+    """
+    from PIL import Image, ImageDraw
+ 
+    pano_h, pano_w = pano_image.shape[:2]
+    uv = project_points_to_pano(
+        points, (pano_w, pano_h),
+        camera_center=camera_center,
+        camera_rotation=camera_rotation,
+    )
+ 
+    canvas = Image.fromarray(pano_image.copy())
+    draw   = ImageDraw.Draw(canvas)
+ 
+    for u_n, v_n in uv:
+        if np.isnan(u_n) or np.isnan(v_n):
+            continue
+        px = int(round(u_n * (pano_w - 1)))
+        py = int(round(v_n * (pano_h - 1)))
+        draw.ellipse(
+            [px - radius, py - radius, px + radius, py + radius],
+            fill=color, outline=(0, 0, 0),
+        )
+ 
+    return np.array(canvas)
 
 def sample_pano_textures(
     plane_meshes: list[o3d.geometry.TriangleMesh],

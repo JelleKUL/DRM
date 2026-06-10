@@ -401,13 +401,16 @@ def txt_pcd_to_ply(txt_path, ply_path):
             f.write(" ".join(r) + "\n")
 
 def open3d_to_bin(pcd, bin_path):
+    if isinstance(pcd, list):
+        combined = o3d.geometry.PointCloud()
+        for p in pcd:
+            combined += p
+        pcd = combined
+
     points = np.asarray(pcd.points)
     colors = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() else np.zeros((len(points), 3), dtype=np.uint8)
 
-    # Combine XYZ and RGB into (N,6) array
     data = np.hstack([points.astype(np.float32), colors])
-
-    # Save to .bin
     data.tofile(bin_path)
     print(f"Saved {len(points)} points to {bin_path}")
     return bin_path
@@ -762,7 +765,11 @@ def _convert_trianglemesh(mesh: o3d.geometry.TriangleMesh, random_color: bool):
         vertex_uvs = uv_accum / np.maximum(uv_count[:, None], 1)
 
         pil_image = Image.fromarray(np.asarray(mesh.textures[0]))
-        material  = trimesh.visual.texture.SimpleMaterial(image=pil_image)
+        material = trimesh.visual.texture.SimpleMaterial(
+            image=pil_image,
+            diffuse=[255, 255, 255, 255],   # full white = no darkening
+            ambient=[255, 255, 255, 255],   # full ambient so unlit areas stay bright
+        )
         tm.visual = trimesh.visual.TextureVisuals(uv=vertex_uvs, material=material)
 
     elif random_color:
@@ -1043,6 +1050,28 @@ def randomly_transform_pointcloud(
     transformed.transform(T)  # apply full transform (rotation + translation)
 
     return transformed, T
+
+def crop_pointcloud(
+    pcd: o3d.geometry.PointCloud,
+    min_bound: list | np.ndarray,
+    max_bound: list | np.ndarray,
+) -> o3d.geometry.PointCloud:
+    """
+    Crop an Open3D point cloud using a global axis-aligned bounding box.
+
+    Args:
+        pcd:       The input Open3D PointCloud.
+        min_bound: [x_min, y_min, z_min] corner of the bounding box.
+        max_bound: [x_max, y_max, z_max] corner of the bounding box.
+
+    Returns:
+        A new PointCloud containing only points within the bounding box.
+    """
+    bbox = o3d.geometry.AxisAlignedBoundingBox(
+        min_bound=np.asarray(min_bound, dtype=np.float64),
+        max_bound=np.asarray(max_bound, dtype=np.float64),
+    )
+    return pcd.crop(bbox)
 
 def radial_fov_crop_pointcloud(
     pcd: o3d.geometry.PointCloud,
@@ -1347,3 +1376,4 @@ def rotation_matrix(axis, degrees=90):
     else:
         raise ValueError("Axis must be 'x', 'y', or 'z'")
     return R
+

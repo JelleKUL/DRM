@@ -13,6 +13,27 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
 
+SCANNET_LABELS = [
+    "cabinet",        # 0
+    "bed",            # 1
+    "chair",          # 2
+    "sofa",           # 3
+    "table",          # 4
+    "door",           # 5
+    "window",         # 6
+    "bookshelf",      # 7
+    "picture",        # 8
+    "counter",        # 9
+    "desk",           # 10
+    "curtain",        # 11
+    "refrigerator",   # 12
+    "shower curtain", # 13
+    "toilet",         # 14
+    "sink",           # 15
+    "bathtub",        # 16
+    "other furniture" # 17
+]
+
 def load_gt_boxes_raw(json_path: str) -> list[dict]:
     """
     Parse bounding boxes from JSON, returning raw corner points and IDs.
@@ -33,13 +54,7 @@ def load_gt_boxes_raw(json_path: str) -> list[dict]:
 
     return boxes
 
-def load_gt_json_boxes_as_mesh(json_path, randomcolors = True):
-    """
-    Load detection results from a JSON file and convert them to a mesh format.
-
-    Args:
-        json_path: Path to the JSON file containing detection results
-    """
+def load_gt_json_boxes_as_mesh(json_path, randomcolors=True, wireframe=False):
     with open(json_path) as f:
         data = json.load(f)
 
@@ -51,76 +66,186 @@ def load_gt_json_boxes_as_mesh(json_path, randomcolors = True):
         pts = np.array([[p["x"], p["y"], p["z"]] for p in box["boundingPoints"]])
         points_list.append(pts)
 
-    # Colormap for labels
     label_colors = [
-        [1, 0, 0, 0.5],  # red, alpha 0.5
-        [0, 1, 0, 0.5],  # green
-        [0, 0, 1, 0.5],  # blue
-        [1, 1, 0, 0.5],  # yellow
-        [1, 0, 1, 0.5],  # magenta
-        [0, 1, 1, 0.5],  # cyan
+        [1, 0, 0, 0.5],
+        [0, 1, 0, 0.5],
+        [0, 0, 1, 0.5],
+        [1, 1, 0, 0.5],
+        [1, 0, 1, 0.5],
+        [0, 1, 1, 0.5],
     ]
 
-    # Create list of meshes
     gt_bb_meshes = []
-    i = 0
-    for points in points_list:
-        if(randomcolors):
-            color = label_colors[i % len(label_colors)]
-        else:
-            color = [0, 0, 1, 0.5]  # blue, alpha 0.5
+    for i, points in enumerate(points_list):
+        color = label_colors[i % len(label_colors)] if randomcolors else [0, 0, 1, 0.5]
 
         mesh = trimesh.convex.convex_hull(points)
         mesh.visual.face_colors = color
         mesh.apply_transform(drm.UNITY2TRIMESH_T)
+
+        if wireframe:
+            mesh = meshes_to_wireframe(mesh)
+            mesh.visual.face_colors = color
+
         gt_bb_meshes.append(mesh)
-        i+=1
 
     return gt_bb_meshes
 
-def load_detected_boxes_as_mesh(json_path, pred_score_thr=0.3, labelColors = True):
-    """
-    Load detection results from a JSON file and convert them to a mesh format.
-
-    Args:
-        json_path: Path to the JSON file containing detection results
-        pred_score_thr: Minimum confidence score for detections to be included
-        labelColors: Whether to use colors for different labels or a fixed color
-    """
+def load_labelcloud_boxes_as_mesh(json_path, labelColors=True, wireframe=False, label_filter=None, label_filter_inverse=False):
     with open(json_path) as f:
         data = json.load(f)
 
-    # Colormap for labels
     label_colors = [
-        [1, 0, 0, 0.5],  # red, alpha 0.5
-        [0, 1, 0, 0.5],  # green
-        [0, 0, 1, 0.5],  # blue
-        [1, 1, 0, 0.5],  # yellow
-        [1, 0, 1, 0.5],  # magenta
-        [0, 1, 1, 0.5],  # cyan
+        [1, 0, 0, 0.5],
+        [0, 1, 0, 0.5],
+        [0, 0, 1, 0.5],
+        [1, 1, 0, 0.5],
+        [1, 0, 1, 0.5],
+        [0, 1, 1, 0.5],
     ]
 
-    # Create list of meshes
-    bb_meshes = []
+    results = []
+    for i, obj in enumerate(data["objects"]):
+        label_name = obj["name"]
 
+        if label_filter is not None:
+            match = label_name in label_filter
+            if label_filter_inverse and match:
+                continue
+            if not label_filter_inverse and not match:
+                continue
+
+        center = np.array([
+            obj["centroid"]["x"],
+            obj["centroid"]["y"],
+            obj["centroid"]["z"],
+        ])
+        size = np.array([
+            obj["dimensions"]["length"],
+            obj["dimensions"]["width"],
+            obj["dimensions"]["height"],
+        ])
+        rotation_z = obj["rotations"]["z"]
+        color      = label_colors[i % len(label_colors)] if labelColors else [0, 0, 1, 0.5]
+
+        mesh = drm.create_trimesh_box(center - [0,0,size[2]/2], size, rotation_z / 180 * np.pi, color)
+
+        if wireframe:
+            mesh = meshes_to_wireframe(mesh)
+            mesh.visual.face_colors = color
+
+        results.append((label_name, mesh))
+
+    labels    = [l for l, _ in results]
+    bb_meshes = [m for _, m in results]
+
+    return bb_meshes, labels
+
+def load_detected_boxes_as_mesh(json_path, pred_score_thr=0.3, labelColors=True, wireframe=False, label_filter=None, label_filter_inverse=False):
+    with open(json_path) as f:
+        data = json.load(f)
+
+    label_colors = [
+        [1, 0, 0, 0.5],
+        [0, 1, 0, 0.5],
+        [0, 0, 1, 0.5],
+        [1, 1, 0, 0.5],
+        [1, 0, 1, 0.5],
+        [0, 1, 1, 0.5],
+    ]
+
+    scored = []
     for label, score, box in zip(data["labels_3d"], data["scores_3d"], data["bboxes_3d"]):
         if score < pred_score_thr:
             continue
 
-        center = np.array(box[:3])
-        size = np.array(box[3:6])
+        label_name = SCANNET_LABELS[int(label)]
+        if label_filter is not None:
+            match = label_name in label_filter
+            if label_filter_inverse and match:
+                continue
+            if not label_filter_inverse and not match:
+                continue
+
+        center     = np.array(box[:3])
+        size       = np.array(box[3:6])
         rotation_z = box[6]
-        if(labelColors):
-            color = label_colors[label % len(label_colors)]
-        else:
-            color = [1, 0, 0, 0.5]  # red, alpha 0.5
-        
+        color      = label_colors[int(label) % len(label_colors)] if labelColors else [1, 0, 0, 0.5]
+
         mesh = drm.create_trimesh_box(center, size, rotation_z, color)
-        bb_meshes.append(mesh)
 
-    # Combine meshes for visualization
-    return bb_meshes
+        if wireframe:
+            mesh = meshes_to_wireframe(mesh)
+            mesh.visual.face_colors = color
 
+        scored.append((score, int(label), mesh))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    scores    = [s for s, _, _ in scored]
+    labels    = [SCANNET_LABELS[l] for _, l, _ in scored]
+    bb_meshes = [m for _, _, m in scored]
+
+    return bb_meshes, scores, labels
+
+def meshes_to_wireframe(
+    meshes,
+    radius: float = 0.01,
+    sections: int = 6,
+    subdivisions: int = 1,
+    angle_threshold: float = 10.0,  # degrees
+) -> trimesh.Trimesh:
+    if isinstance(meshes, trimesh.Trimesh):
+        meshes = [meshes]
+
+    parts: list[trimesh.Trimesh] = []
+
+    for mesh in meshes:
+        # Find edges shared by two faces with a large normal angle change
+        face_adjacency        = mesh.face_adjacency           # (E, 2) face index pairs
+        face_adjacency_edges  = mesh.face_adjacency_edges     # (E, 2) vertex index pairs
+        angles                = mesh.face_adjacency_angles    # (E,)   angle in radians
+
+        threshold_rad = np.deg2rad(angle_threshold)
+        hard_edges = face_adjacency_edges[angles > threshold_rad]
+
+        for start_idx, end_idx in hard_edges:
+            start  = mesh.vertices[start_idx]
+            end    = mesh.vertices[end_idx]
+            segment = end - start
+            length  = np.linalg.norm(segment)
+            if length < 1e-12:
+                continue
+            cylinder = trimesh.creation.cylinder(radius=radius, height=length, sections=sections)
+            direction = segment / length
+            z_axis    = np.array([0.0, 0.0, 1.0])
+            rotation  = _rotation_between(z_axis, direction)
+            transform = np.eye(4)
+            transform[:3, :3] = rotation
+            transform[:3, 3]  = (start + end) / 2.0
+            cylinder.apply_transform(transform)
+            parts.append(cylinder)
+
+        for v in mesh.vertices:
+            sphere = trimesh.creation.icosphere(subdivisions=subdivisions, radius=radius)
+            sphere.apply_translation(v)
+            parts.append(sphere)
+
+    return trimesh.util.concatenate(parts)
+
+
+def _rotation_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Compute a 3x3 rotation matrix that rotates unit vector a onto unit vector b."""
+    v = np.cross(a, b)
+    c = np.dot(a, b)
+    if np.linalg.norm(v) < 1e-12:
+        return np.eye(3) if c > 0 else -np.eye(3)
+    skew = np.array([
+        [0, -v[2], v[1]],
+        [v[2], 0, -v[0]],
+        [-v[1], v[0], 0],
+    ])
+    return np.eye(3) + skew + skew @ skew / (1.0 + c)
 
 def split_pointcloud_by_boxes(
     pcd: o3d.geometry.PointCloud,
